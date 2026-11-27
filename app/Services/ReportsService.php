@@ -1,0 +1,1104 @@
+<?php
+
+namespace App\Services;
+
+use App\Models\Booking;
+use App\Models\EntranceSlip;
+use App\Models\Facility;
+use App\Models\FacilityType;
+use App\Models\GuestFine;
+use App\Models\Payment;
+use App\Models\RefundRequest;
+use App\Models\Reservation;
+use App\Models\User;
+use Carbon\CarbonImmutable;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Collection as EloquentCollection;
+use Illuminate\Database\Query\Builder as QueryBuilder;
+use Illuminate\Pagination\LengthAwarePaginator;
+use Illuminate\Pagination\Paginator;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\DB;
+
+class ReportsService
+{
+    public function __construct(
+        private readonly FinancialReportMetricsService $financialMetrics,
+    ) {}
+    public function revenueReport(
+        string $startDate,
+        string $endDate,
+        ?int $cashierUserId = null,
+        int $perPage = 25,
+        string $search = '',
+        string $pageName = 'reportPage',
+        bool $allRows = false,
+    ): array {
+        $base = Payment::query()
+            ->whereDate('date_paid', '>=', $startDate)
+            ->whereDate('date_paid', '<=', $endDate)
+            ->whereRaw(
+                'LOWER(payment_status) = ?',
+                ['verified'],
+            );
+
+        if ($cashierUserId !== null) {
+            $base->where(function (Builder $query) use ($cashierUserId): void {
+                $query->where('user_id', $cashierUserId)
+                    ->orWhere('verified_by_user_id', $cashierUserId);
+            });
+        }
+
+        $this->applyRevenueSearch($base, $search);
+
+        $count = (clone $base)->count();
+        $total = round((float) (clone $base)->sum('amount_paid'), 2);
+
+        $byMode = (clone $base)
+            ->leftJoin(
+                'tbl_mode_of_payment',
+                'tbl_mode_of_payment.mode_of_payment_id',
+                '=',
+                'tbl_payment.mode_of_payment_id',
+            )
+            ->selectRaw(
+                "COALESCE(tbl_mode_of_payment.mode_of_payment, 'Unknown') as payment_mode"
+            )
+            ->selectRaw('SUM(tbl_payment.amount_paid) as total_amount')
+            ->groupBy('tbl_mode_of_payment.mode_of_payment')
+            ->orderBy('payment_mode')
+            ->pluck('total_amount', 'payment_mode')
+            ->map(fn (mixed $amount): float => round((float) $amount, 2));
+
+        $rowsQuery = (clone $base)
+            ->with([
+                'modeOfPayment',
+                'user',
+                'verifier',
+                'booking.guest',
+                'reservation.guest',
+                'entranceSlip.guest',
+            ])
+            ->orderBy('date_paid')
+            ->orderBy('payment_id');
+
+        // Refunds the cashier gave back to guests in the range reduce revenue.
+        $refundBase = RefundRequest::query()
+            ->whereNotNull('tbl_refund_request.refunded_at')
+            ->whereDate('tbl_refund_request.refunded_at', '>=', $startDate)
+            ->whereDate('tbl_refund_request.refunded_at', '<=', $endDate);
+
+        if ($cashierUserId !== null) {
+            $refundBase->where('tbl_refund_request.refunded_by_user_id', $cashierUserId);
+        }
+
+        $needle = trim($search);
+
+        if ($needle !== '') {
+            $like = '%'.$needle.'%';
+
+            $matchesPerson = fn (Builder $guest) => $guest
+                ->where('first_name', 'like', $like)
+                ->orWhere('last_name', 'like', $like)
+                ->orWhere('contact_no', 'like', $like);
+
+            $refundBase->where(function (Builder $outer) use ($like, $matchesPerson): void {
+                $outer->whereHas('reservation', function (Builder $reservation) use ($like, $matchesPerson): void {
+                    $reservation->where('r_ref_no', 'like', $like)
+                        ->orWhereHas('guest', $matchesPerson);
+                })->orWhereHas('booking', function (Builder $booking) use ($like, $matchesPerson): void {
+                    $booking->where('b_ref_no', 'like', $like)
+                        ->orWhereHas('guest', $matchesPerson);
+                });
+            });
+        }
+
+        $refundTotal = round((float) (clone $refundBase)->sum('tbl_refund_request.refunded_amount'), 2);
+        $refundCount = (clone $refundBase)->count();
+
+        $refundsByMode = (clone $refundBase)
+            ->leftJoin(
+                'tbl_mode_of_payment',
+                'tbl_mode_of_payment.mode_of_payment_id',
+                '=',
+                'tbl_refund_request.refund_mode_of_payment_id',
+            )
+            ->selectRaw("COALESCE(tbl_mode_of_payment.mode_of_payment, 'Unknown') as payment_mode")
+            ->selectRaw('SUM(tbl_refund_request.refunded_amount) as total_amount')
+            ->groupBy('tbl_mode_of_payment.mode_of_payment')
+            ->pluck('total_amount', 'payment_mode');
+
+        foreach ($refundsByMode as $mode => $amount) {
+            $byMode->put($mode, round((float) ($byMode[$mode] ?? 0) - (float) $amount, 2));
+        }
+
+        $refundRows = (clone $refundBase)
+            ->with(['reservation.guest', 'booking.guest', 'refundModeOfPayment', 'refundedBy'])
+            ->orderBy('tbl_refund_request.refunded_at')
+            ->get();
+
+        $financialMetrics =
+            $this->financialMetrics->summary(
+                $startDate,
+                $endDate,
+                $cashierUserId,
+            );
+
+        $dailyRevenue =
+            $this->financialMetrics
+                ->dailyVerifiedRevenue(
+                    $startDate,
+                    $endDate,
+                    $cashierUserId,
+                );
+
+        return [
+            'rows' => $this->paginateOrGet(
+                $rowsQuery,
+                $perPage,
+                $pageName,
+                $allRows,
+            ),
+            'total' => $total,
+            'gross_total' => $total,
+            'refund_total' => $refundTotal,
+            'refund_count' => $refundCount,
+            'net_total' => round($total - $refundTotal, 2),
+            'refund_rows' => $refundRows,
+            'by_mode' => $byMode->sortKeys(),
+            'count' => $count,
+            'financial_metrics' =>
+                $financialMetrics,
+            'daily_revenue' => $dailyRevenue,
+            'show_outstanding_metrics' =>
+                $cashierUserId === null,
+        ];
+    }
+
+    public function bookingSummaryReport(
+        string $startDate,
+        string $endDate,
+        ?int $cashierUserId = null,
+        int $perPage = 25,
+        string $search = '',
+        string $pageName = 'reportPage',
+        bool $allRows = false,
+        ?string $source = null,
+    ): array {
+        $base = Booking::query()
+            ->whereDate('booking_date', '>=', $startDate)
+            ->whereDate('booking_date', '<=', $endDate);
+
+        if ($cashierUserId !== null) {
+            $base->where('user_id', $cashierUserId);
+        }
+
+        // Bookings made online by the guest have no staff user; the ones a cashier
+        // created (including reservations a cashier converted) carry that cashier.
+        if ($source === 'guest') {
+            $base->whereNull('user_id');
+        } elseif ($source === 'cashier') {
+            $base->whereNotNull('user_id');
+        }
+
+        $this->applyBookingSearch($base, $search);
+
+        $count = (clone $base)->count();
+        $totalGuests = (int) (clone $base)->sum('total_guest_count');
+        $totalPrice = round(
+            (float) (clone $base)->sum('total_price'),
+            2,
+        );
+        $totalDue = round(
+            (float) (clone $base)->sum('amount_due'),
+            2,
+        );
+
+        $rowsQuery = (clone $base)
+            ->with([
+                'guest',
+                'user',
+                'details.facility.facilityType',
+                'payments.modeOfPayment',
+            ])
+            ->orderBy('booking_date')
+            ->orderBy('booking_id');
+
+        return [
+            'rows' => $this->paginateOrGet(
+                $rowsQuery,
+                $perPage,
+                $pageName,
+                $allRows,
+            ),
+            'total_price' => $totalPrice,
+            'total_due' => $totalDue,
+            'count' => $count,
+        ];
+    }
+
+    public function cancellationReport(
+        string $startDate,
+        string $endDate,
+        int $perPage = 25,
+        string $search = '',
+        string $pageName = 'reportPage',
+        bool $allRows = false,
+        ?string $outcome = null,
+        ?string $recordType = null,
+        bool $extended = false,
+    ): array {
+        if ($extended) {
+            return $this->extendedCancellationReport(
+                $startDate,
+                $endDate,
+                $perPage,
+                $search,
+                $pageName,
+                $allRows,
+                $outcome,
+                $recordType,
+            );
+        }
+
+        $base = Reservation::query()
+            ->whereNotNull('cancelled_at')
+            ->whereDate('cancelled_at', '>=', $startDate)
+            ->whereDate('cancelled_at', '<=', $endDate);
+
+        $this->applyCancellationSearch($base, $search);
+
+        $count = (clone $base)->count();
+
+        $rowsQuery = (clone $base)
+            ->with([
+                'guest',
+                'user',
+                'details.facility.facilityType',
+                'payments',
+                'refundRequests',
+            ])
+            ->orderBy('cancelled_at')
+            ->orderBy('reservation_id');
+
+        $refunds = RefundRequest::query()
+            ->whereIn('reservation_id', (clone $base)->select('tbl_reservation.reservation_id'));
+
+        return [
+            'extended' => false,
+            'rows' => $this->paginateOrGet(
+                $rowsQuery,
+                $perPage,
+                $pageName,
+                $allRows,
+            ),
+            'count' => $count,
+            'refund_approved_total' => round((float) (clone $refunds)
+                ->where('status', RefundRequest::STATUS_APPROVED)
+                ->sum('approved_amount'), 2),
+            'refund_approved_count' => (clone $refunds)
+                ->where('status', RefundRequest::STATUS_APPROVED)
+                ->count(),
+            'refund_pending_count' => (clone $refunds)
+                ->where('status', RefundRequest::STATUS_PENDING)
+                ->count(),
+        ];
+    }
+
+    /**
+     * Cancelled reservations, cancelled bookings and no-show reservations in one list.
+     * (Bookings have no no-show status, only reservations do.)
+     *
+     * @param  ?string  $outcome  null (all), 'cancelled' or 'no_show'
+     * @param  ?string  $recordType  null (all), 'reservation' or 'booking'
+     */
+    private function extendedCancellationReport(
+        string $startDate,
+        string $endDate,
+        int $perPage,
+        string $search,
+        string $pageName,
+        bool $allRows,
+        ?string $outcome,
+        ?string $recordType,
+    ): array {
+        $wantCancelled = $outcome !== 'no_show';
+        $wantNoShow = $outcome !== 'cancelled';
+        $wantReservations = $recordType !== 'booking';
+        $wantBookings = $recordType !== 'reservation';
+        $refundsService = app(RefundRequestWorkflowService::class);
+        $rows = collect();
+
+        if ($wantReservations && $wantCancelled) {
+            $query = Reservation::query()
+                ->whereNotNull('cancelled_at')
+                ->whereDate('cancelled_at', '>=', $startDate)
+                ->whereDate('cancelled_at', '<=', $endDate);
+
+            $this->applyCancellationSearch($query, $search);
+
+            $query->with(['guest', 'user', 'details.facility.facilityType', 'payments', 'refundRequests'])
+                ->get()
+                ->each(function (Reservation $reservation) use ($rows, $refundsService): void {
+                    $reservation->setAttribute('report_kind', 'Reservation');
+                    $reservation->setAttribute('report_outcome', 'Cancelled');
+                    $reservation->setAttribute('report_date', $reservation->cancelled_at);
+                    $reservation->setAttribute('report_ref', $reservation->r_ref_no);
+                    $reservation->setAttribute('report_reason', $reservation->cancellation_reason);
+                    $reservation->setAttribute('report_paid', $refundsService->amountPaid($reservation));
+                    $rows->push($reservation);
+                });
+        }
+
+        if ($wantReservations && $wantNoShow) {
+            // A no-show happened on the date the guest was due, so that date is what
+            // the report period is matched against.
+            $query = Reservation::query()
+                ->where('status', 'No-show')
+                ->whereHas('details', function (Builder $details) use ($startDate, $endDate): void {
+                    $details->whereDate('check_in_date', '>=', $startDate)
+                        ->whereDate('check_in_date', '<=', $endDate);
+                });
+
+            $this->applyCancellationSearch($query, $search);
+
+            $query->with(['guest', 'user', 'details.facility.facilityType', 'payments', 'refundRequests'])
+                ->get()
+                ->each(function (Reservation $reservation) use ($rows, $refundsService): void {
+                    $due = $reservation->details->min('check_in_date');
+
+                    $reservation->setAttribute('report_kind', 'Reservation');
+                    $reservation->setAttribute('report_outcome', 'No-show');
+                    $reservation->setAttribute('report_date', $due !== null ? \Illuminate\Support\Carbon::parse($due) : null);
+                    $reservation->setAttribute('report_ref', $reservation->r_ref_no);
+                    $reservation->setAttribute('report_reason', 'Guest did not arrive');
+                    $reservation->setAttribute('report_paid', $refundsService->amountPaid($reservation));
+                    $rows->push($reservation);
+                });
+        }
+
+        if ($wantBookings && $wantCancelled) {
+            $query = Booking::query()
+                ->whereNotNull('cancelled_at')
+                ->whereDate('cancelled_at', '>=', $startDate)
+                ->whereDate('cancelled_at', '<=', $endDate);
+
+            $this->applyBookingCancellationSearch($query, $search);
+
+            $query->with(['guest', 'user', 'details.facility.facilityType', 'payments', 'reservation.payments', 'refundRequests'])
+                ->get()
+                ->each(function (Booking $booking) use ($rows, $refundsService): void {
+                    $booking->setAttribute('report_kind', 'Booking');
+                    $booking->setAttribute('report_outcome', 'Cancelled');
+                    $booking->setAttribute('report_date', $booking->cancelled_at);
+                    $booking->setAttribute('report_ref', $booking->b_ref_no);
+                    $booking->setAttribute('report_reason', $booking->cancellation_reason);
+                    $booking->setAttribute('report_paid', $refundsService->amountPaid($booking));
+                    $rows->push($booking);
+                });
+        }
+
+        $rows = $rows
+            ->sortBy([
+                fn ($a, $b) => ($a->report_date?->timestamp ?? 0) <=> ($b->report_date?->timestamp ?? 0),
+                fn ($a, $b) => strcmp((string) $a->report_ref, (string) $b->report_ref),
+            ])
+            ->values();
+
+        $reservationIds = $rows->where('report_kind', 'Reservation')->map(fn ($row) => $row->getKey())->all();
+        $bookingIds = $rows->where('report_kind', 'Booking')->map(fn ($row) => $row->getKey())->all();
+
+        $refunds = RefundRequest::query()->where(function (Builder $query) use ($reservationIds, $bookingIds): void {
+            $query->whereIn('reservation_id', $reservationIds ?: [0])
+                ->orWhereIn('booking_id', $bookingIds ?: [0]);
+        });
+
+        if ($allRows) {
+            $pageRows = $rows;
+        } else {
+            $perPage = $this->validPerPage($perPage);
+            $page = Paginator::resolveCurrentPage($pageName);
+
+            $pageRows = new LengthAwarePaginator(
+                $rows->forPage($page, $perPage)->values(),
+                $rows->count(),
+                $perPage,
+                $page,
+                ['path' => Paginator::resolveCurrentPath(), 'pageName' => $pageName],
+            );
+        }
+
+        return [
+            'extended' => true,
+            'rows' => $pageRows,
+            'count' => $rows->count(),
+            'cancelled_count' => $rows->where('report_outcome', 'Cancelled')->count(),
+            'no_show_count' => $rows->where('report_outcome', 'No-show')->count(),
+            'reservation_count' => count($reservationIds),
+            'booking_count' => count($bookingIds),
+            'refund_approved_total' => round((float) (clone $refunds)
+                ->where('status', RefundRequest::STATUS_APPROVED)
+                ->sum('approved_amount'), 2),
+            'refund_approved_count' => (clone $refunds)
+                ->where('status', RefundRequest::STATUS_APPROVED)
+                ->count(),
+            'refund_pending_count' => (clone $refunds)
+                ->where('status', RefundRequest::STATUS_PENDING)
+                ->count(),
+        ];
+    }
+
+    private function applyBookingCancellationSearch(
+        Builder $query,
+        string $search,
+    ): void {
+        if (trim($search) === '') {
+            return;
+        }
+
+        $like = '%'.trim($search).'%';
+
+        $query->where(function (Builder $query) use ($like): void {
+            $query->where('b_ref_no', 'like', $like)
+                ->orWhere('cancellation_reason', 'like', $like)
+                ->orWhereHas('guest', function (Builder $query) use ($like): void {
+                    $this->applyGuestSearch($query, $like);
+                })
+                ->orWhereHas('details.facility', function (Builder $query) use ($like): void {
+                    $query->where('facility_name', 'like', $like);
+                });
+        });
+    }
+
+    /** Cashier accounts, for the "handled by" filter. */
+    public function cashiers(): EloquentCollection
+    {
+        return User::query()
+            ->whereHas('role', fn (Builder $role) => $role->where('role_name', 'Cashier'))
+            ->orderBy('first_name')
+            ->orderBy('last_name')
+            ->get();
+    }
+
+    public function damagedAmenitiesReport(
+        string $startDate,
+        string $endDate,
+        int $perPage = 25,
+        string $search = '',
+        string $pageName = 'reportPage',
+        bool $allRows = false,
+    ): array {
+        $base = GuestFine::query()
+            ->whereDate('date_checked', '>=', $startDate)
+            ->whereDate('date_checked', '<=', $endDate);
+
+        $this->applyDamagedAmenitySearch($base, $search);
+
+        $count = (clone $base)->count();
+        $totalCharge = round(
+            (float) (clone $base)->sum('total_charge'),
+            2,
+        );
+
+        $rowsQuery = (clone $base)
+            ->with([
+                'booking.guest',
+                'fine.amenity.amenityName',
+                'fine.damageType',
+                'facility.facilityType',
+                'reportedBy',
+            ])
+            ->orderBy('date_checked')
+            ->orderBy('guest_fine_id');
+
+        return [
+            'rows' => $this->paginateOrGet(
+                $rowsQuery,
+                $perPage,
+                $pageName,
+                $allRows,
+            ),
+            'total_charge' => $totalCharge,
+            'count' => $count,
+        ];
+    }
+
+    public function availableFacilitiesReport(
+        string $startDate,
+        string $endDate,
+        ?int $facilityTypeId = null,
+        int $perPage = 25,
+        string $search = '',
+        string $pageName = 'reportPage',
+        bool $allRows = false,
+    ): array {
+        $blockedFacilityIds = $this->blockedFacilityIds(
+            $startDate,
+            $endDate,
+        );
+
+        $base = Facility::query()
+            ->where('tbl_facility.facility_status', 'Available')
+            ->when(
+                $blockedFacilityIds !== [],
+                fn (Builder $query) => $query->whereNotIn(
+                    'tbl_facility.facility_id',
+                    $blockedFacilityIds,
+                ),
+            )
+            ->when(
+                $facilityTypeId !== null,
+                fn (Builder $query) => $query->where(
+                    'tbl_facility.facility_type_id',
+                    $facilityTypeId,
+                ),
+            );
+
+        $this->applyFacilitySearch($base, $search);
+
+        $count = (clone $base)->count();
+
+        $byType = (clone $base)
+            ->join(
+                'tbl_facility_type',
+                'tbl_facility_type.facility_type_id',
+                '=',
+                'tbl_facility.facility_type_id',
+            )
+            ->select('tbl_facility_type.facility_type')
+            ->selectRaw('COUNT(tbl_facility.facility_id) as facility_count')
+            ->groupBy('tbl_facility_type.facility_type')
+            ->orderBy('tbl_facility_type.facility_type')
+            ->pluck('facility_count', 'facility_type')
+            ->map(fn (mixed $value): int => (int) $value);
+
+        $rowsQuery = (clone $base)
+            ->with([
+                'facilityType',
+                'prices',
+            ])
+            ->orderBy('tbl_facility.facility_type_id')
+            ->orderBy('tbl_facility.facility_name');
+
+        return [
+            'rows' => $this->paginateOrGet(
+                $rowsQuery,
+                $perPage,
+                $pageName,
+                $allRows,
+            ),
+            'count' => $count,
+            'by_type' => $byType,
+        ];
+    }
+
+    public function facilityUtilizationReport(
+        string $startDate,
+        string $endDate,
+        ?int $facilityTypeId = null,
+        int $perPage = 25,
+        string $search = '',
+        string $pageName = 'reportPage',
+        bool $allRows = false,
+    ): array {
+        $base = DB::table('tbl_booking_details')
+            ->join(
+                'tbl_booking',
+                'tbl_booking.booking_id',
+                '=',
+                'tbl_booking_details.booking_id',
+            )
+            ->join(
+                'tbl_facility',
+                'tbl_facility.facility_id',
+                '=',
+                'tbl_booking_details.facility_id',
+            )
+            ->join(
+                'tbl_facility_type',
+                'tbl_facility_type.facility_type_id',
+                '=',
+                'tbl_facility.facility_type_id',
+            )
+            ->select([
+                'tbl_facility.facility_id',
+                'tbl_facility.facility_name',
+                'tbl_facility.facility_size',
+                'tbl_facility.capacity',
+                'tbl_facility_type.facility_type',
+                DB::raw(
+                    'COUNT(tbl_booking_details.booking_details_id) as booking_count'
+                ),
+            ])
+            ->whereDate('tbl_booking.booking_date', '>=', $startDate)
+            ->whereDate('tbl_booking.booking_date', '<=', $endDate)
+            ->whereNotIn(
+                'tbl_booking.status',
+                ['Cancelled', 'Canceled'],
+            )
+            ->whereNotIn(
+                'tbl_booking_details.status',
+                ['Cancelled', 'Canceled', 'Transferred'],
+            )
+            ->when(
+                $facilityTypeId !== null,
+                fn (QueryBuilder $query) => $query->where(
+                    'tbl_facility.facility_type_id',
+                    $facilityTypeId,
+                ),
+            )
+            ->when(trim($search) !== '', function (QueryBuilder $query) use ($search): void {
+                $like = '%'.trim($search).'%';
+
+                $query->where(function (QueryBuilder $query) use ($like): void {
+                    $query->where(
+                        'tbl_facility.facility_name',
+                        'like',
+                        $like,
+                    )
+                        ->orWhere(
+                            'tbl_facility.facility_size',
+                            'like',
+                            $like,
+                        )
+                        ->orWhere(
+                            'tbl_facility.capacity',
+                            'like',
+                            $like,
+                        )
+                        ->orWhere(
+                            'tbl_facility_type.facility_type',
+                            'like',
+                            $like,
+                        );
+                });
+            })
+            ->groupBy([
+                'tbl_facility.facility_id',
+                'tbl_facility.facility_name',
+                'tbl_facility.facility_size',
+                'tbl_facility.capacity',
+                'tbl_facility_type.facility_type',
+            ]);
+
+        $summaryRows = (clone $base)->get();
+        $totalBookings = (int) $summaryRows->sum('booking_count');
+        $count = $summaryRows->count();
+
+        $rowsQuery = (clone $base)
+            ->orderByDesc('booking_count')
+            ->orderBy('tbl_facility.facility_name');
+
+        $rows = $this->paginateOrGet(
+            $rowsQuery,
+            $perPage,
+            $pageName,
+            $allRows,
+        );
+
+        $transform = function (object $row) use ($totalBookings): object {
+            $row->utilization_percentage = $totalBookings > 0
+                ? round(
+                    ((int) $row->booking_count / $totalBookings) * 100,
+                    2,
+                )
+                : 0.00;
+
+            return $row;
+        };
+
+        if ($rows instanceof Collection) {
+            $rows = $rows->map($transform);
+        } else {
+            $rows->setCollection(
+                $rows->getCollection()->map($transform)
+            );
+        }
+
+        return [
+            'rows' => $rows,
+            'total_bookings' => $totalBookings,
+            'count' => $count,
+        ];
+    }
+
+    public function tourismEnterpriseMonthlyReport(
+        int $year,
+        int $month,
+        int $perPage = 25,
+        string $search = '',
+        string $pageName = 'reportPage',
+        bool $allRows = false,
+    ): array {
+        $start = CarbonImmutable::create($year, $month, 1)
+            ->startOfMonth()
+            ->toDateString();
+        $end = CarbonImmutable::create($year, $month, 1)
+            ->endOfMonth()
+            ->toDateString();
+
+        $base = EntranceSlip::query()
+            ->whereDate('date_created', '>=', $start)
+            ->whereDate('date_created', '<=', $end)
+            ->where('status', 'Paid');
+
+        $this->applyTourismSearch($base, $search);
+
+        $summary = (clone $base)
+            ->selectRaw('COUNT(*) as slip_count')
+            ->selectRaw('COALESCE(SUM(no_of_Male), 0) as male')
+            ->selectRaw('COALESCE(SUM(no_of_Female), 0) as female')
+            ->selectRaw('COALESCE(SUM(no_of_Tourist), 0) as tourist')
+            ->selectRaw(
+                'COALESCE(SUM(no_of_adult), 0)
+                 + COALESCE(SUM(no_of_children), 0)
+                 + COALESCE(SUM(no_of_PWD_SC), 0)
+                 as total_guests'
+            )
+            ->first();
+
+        $rowsQuery = (clone $base)
+            ->with([
+                'createdBy',
+                'handledBy',
+            ])
+            ->orderBy('date_created')
+            ->orderBy('entrance_slip_id');
+
+        return [
+            'rows' => $this->paginateOrGet(
+                $rowsQuery,
+                $perPage,
+                $pageName,
+                $allRows,
+            ),
+            'male' => (int) ($summary->male ?? 0),
+            'female' => (int) ($summary->female ?? 0),
+            'tourist' => (int) ($summary->tourist ?? 0),
+            'total_guests' => (int) ($summary->total_guests ?? 0),
+            'count' => (int) ($summary->slip_count ?? 0),
+        ];
+    }
+
+    public function facilityTypes(): EloquentCollection
+    {
+        return FacilityType::query()
+            ->orderBy('facility_type')
+            ->get();
+    }
+
+    private function applyRevenueSearch(
+        Builder $query,
+        string $search,
+    ): void {
+        if (trim($search) === '') {
+            return;
+        }
+
+        $like = '%'.trim($search).'%';
+
+        $query->where(function (Builder $query) use ($like): void {
+            $query->where('p_ref_no', 'like', $like)
+                ->orWhere('reference_number', 'like', $like)
+                ->orWhereHas('modeOfPayment', function (Builder $query) use ($like): void {
+                    $query->where('mode_of_payment', 'like', $like);
+                })
+                ->orWhereHas('booking', function (Builder $query) use ($like): void {
+                    $query->where('b_ref_no', 'like', $like)
+                        ->orWhereHas('guest', function (Builder $query) use ($like): void {
+                            $this->applyGuestSearch($query, $like);
+                        });
+                })
+                ->orWhereHas('reservation', function (Builder $query) use ($like): void {
+                    $query->where('r_ref_no', 'like', $like)
+                        ->orWhereHas('guest', function (Builder $query) use ($like): void {
+                            $this->applyGuestSearch($query, $like);
+                        });
+                })
+                ->orWhereHas('entranceSlip.guest', function (Builder $query) use ($like): void {
+                    $this->applyGuestSearch($query, $like);
+                })
+                ->orWhereHas('user', function (Builder $query) use ($like): void {
+                    $this->applyUserSearch($query, $like);
+                })
+                ->orWhereHas('verifier', function (Builder $query) use ($like): void {
+                    $this->applyUserSearch($query, $like);
+                });
+        });
+    }
+
+    private function applyBookingSearch(
+        Builder $query,
+        string $search,
+    ): void {
+        if (trim($search) === '') {
+            return;
+        }
+
+        $like = '%'.trim($search).'%';
+
+        $query->where(function (Builder $query) use ($like): void {
+            $query->where('b_ref_no', 'like', $like)
+                ->orWhere('status', 'like', $like)
+                ->orWhereHas('guest', function (Builder $query) use ($like): void {
+                    $this->applyGuestSearch($query, $like);
+                })
+                ->orWhereHas('details.facility', function (Builder $query) use ($like): void {
+                    $query->where('facility_name', 'like', $like);
+                });
+        });
+    }
+
+    private function applyCancellationSearch(
+        Builder $query,
+        string $search,
+    ): void {
+        if (trim($search) === '') {
+            return;
+        }
+
+        $like = '%'.trim($search).'%';
+
+        $query->where(function (Builder $query) use ($like): void {
+            $query->where('r_ref_no', 'like', $like)
+                ->orWhere('cancellation_reason', 'like', $like)
+                ->orWhereHas('guest', function (Builder $query) use ($like): void {
+                    $this->applyGuestSearch($query, $like);
+                })
+                ->orWhereHas('details.facility', function (Builder $query) use ($like): void {
+                    $query->where('facility_name', 'like', $like);
+                });
+        });
+    }
+
+    private function applyDamagedAmenitySearch(
+        Builder $query,
+        string $search,
+    ): void {
+        if (trim($search) === '') {
+            return;
+        }
+
+        $like = '%'.trim($search).'%';
+
+        $query->where(function (Builder $query) use ($like): void {
+            $query->whereHas('booking', function (Builder $query) use ($like): void {
+                $query->where('b_ref_no', 'like', $like)
+                    ->orWhereHas('guest', function (Builder $query) use ($like): void {
+                        $this->applyGuestSearch($query, $like);
+                    });
+            })
+                ->orWhereHas('facility', function (Builder $query) use ($like): void {
+                    $query->where('facility_name', 'like', $like);
+                })
+                ->orWhereHas('fine', function (Builder $query) use ($like): void {
+                    $query->where('situational_fine', 'like', $like)
+                        ->orWhere(
+                            'situational_fine_description',
+                            'like',
+                            $like,
+                        )
+                        ->orWhereHas('amenity', function (Builder $query) use ($like): void {
+                            $query->where(
+                                'amenity_description',
+                                'like',
+                                $like,
+                            )
+                                ->orWhereHas('amenityName', function (Builder $query) use ($like): void {
+                                    $query->where(
+                                        'amenity_name',
+                                        'like',
+                                        $like,
+                                    );
+                                });
+                        })
+                        ->orWhereHas('damageType', function (Builder $query) use ($like): void {
+                            $query->where(
+                                'damage_type',
+                                'like',
+                                $like,
+                            );
+                        });
+                })
+                ->orWhereHas('reportedBy', function (Builder $query) use ($like): void {
+                    $this->applyUserSearch($query, $like);
+                });
+        });
+    }
+
+    private function applyFacilitySearch(
+        Builder $query,
+        string $search,
+    ): void {
+        if (trim($search) === '') {
+            return;
+        }
+
+        $like = '%'.trim($search).'%';
+
+        $query->where(function (Builder $query) use ($like): void {
+            $query->where('tbl_facility.facility_name', 'like', $like)
+                ->orWhere('tbl_facility.facility_size', 'like', $like)
+                ->orWhere('tbl_facility.capacity', 'like', $like)
+                ->orWhereHas('facilityType', function (Builder $query) use ($like): void {
+                    $query->where('facility_type', 'like', $like);
+                });
+        });
+    }
+
+    private function applyTourismSearch(
+        Builder $query,
+        string $search,
+    ): void {
+        $search = trim($search);
+
+        if ($search === '') {
+            return;
+        }
+
+        $like = '%'.$search.'%';
+        $numeric = ctype_digit($search) ? (int) $search : null;
+
+        $query->where(function (Builder $query) use ($like, $numeric): void {
+            $query->where('date_created', 'like', $like)
+                ->orWhereHas('createdBy', function (Builder $query) use ($like): void {
+                    $this->applyUserSearch($query, $like);
+                })
+                ->orWhereHas('handledBy', function (Builder $query) use ($like): void {
+                    $this->applyUserSearch($query, $like);
+                });
+
+            if ($numeric !== null) {
+                $query->orWhere('entrance_slip_id', $numeric);
+            }
+        });
+    }
+
+    private function applyGuestSearch(
+        Builder $query,
+        string $like,
+    ): void {
+        $query->where(function (Builder $query) use ($like): void {
+            $query->where('first_name', 'like', $like)
+                ->orWhere('middle_name', 'like', $like)
+                ->orWhere('last_name', 'like', $like)
+                ->orWhere('contact_no', 'like', $like)
+                ->orWhere('email', 'like', $like);
+        });
+    }
+
+    private function applyUserSearch(
+        Builder $query,
+        string $like,
+    ): void {
+        $query->where(function (Builder $query) use ($like): void {
+            $query->where('first_name', 'like', $like)
+                ->orWhere('middle_name', 'like', $like)
+                ->orWhere('last_name', 'like', $like)
+                ->orWhere('username', 'like', $like)
+                ->orWhere('email', 'like', $like);
+        });
+    }
+
+    private function paginateOrGet(
+        Builder|QueryBuilder $query,
+        int $perPage,
+        string $pageName,
+        bool $allRows,
+    ): mixed {
+        if ($allRows) {
+            return $query->get();
+        }
+
+        return $query->paginate(
+            $this->validPerPage($perPage),
+            ['*'],
+            $pageName,
+        );
+    }
+
+    private function validPerPage(int $perPage): int
+    {
+        return in_array($perPage, [10, 25, 50, 100], true)
+            ? $perPage
+            : 25;
+    }
+
+    private function blockedFacilityIds(
+        string $startDate,
+        string $endDate,
+    ): array {
+        $bookingBlocked = DB::table('tbl_booking_details')
+            ->join(
+                'tbl_booking',
+                'tbl_booking.booking_id',
+                '=',
+                'tbl_booking_details.booking_id',
+            )
+            ->whereNotNull('tbl_booking_details.facility_id')
+            ->whereNotIn(
+                'tbl_booking.status',
+                ['Cancelled', 'Canceled', 'Checked-out'],
+            )
+            ->whereNotIn(
+                'tbl_booking_details.status',
+                [
+                    'Cancelled',
+                    'Canceled',
+                    'Transferred',
+                    'Checked-out',
+                ],
+            )
+            ->where(
+                'tbl_booking_details.check_in_date',
+                '<=',
+                $endDate,
+            )
+            ->where(
+                'tbl_booking_details.check_out_date',
+                '>=',
+                $startDate,
+            )
+            ->pluck('tbl_booking_details.facility_id')
+            ->all();
+
+        $reservationBlocked = DB::table('tbl_reservation_details')
+            ->join(
+                'tbl_reservation',
+                'tbl_reservation.reservation_id',
+                '=',
+                'tbl_reservation_details.reservation_id',
+            )
+            ->whereNotNull('tbl_reservation_details.facility_id')
+            ->whereNotIn(
+                'tbl_reservation.status',
+                [
+                    'Cancelled',
+                    'Canceled',
+                    'Expired',
+                    'Converted',
+                ],
+            )
+            ->where(
+                'tbl_reservation_details.check_in_date',
+                '<=',
+                $endDate,
+            )
+            ->where(
+                'tbl_reservation_details.check_out_date',
+                '>=',
+                $startDate,
+            )
+            ->pluck('tbl_reservation_details.facility_id')
+            ->all();
+
+        return array_values(
+            array_unique(
+                array_merge(
+                    $bookingBlocked,
+                    $reservationBlocked,
+                )
+            )
+        );
+    }
+}

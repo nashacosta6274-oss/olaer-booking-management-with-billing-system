@@ -1,0 +1,244 @@
+<?php
+
+use App\Services\StaffPasswordResetService;
+use Illuminate\Support\Facades\RateLimiter;
+use Illuminate\Validation\Rules\Password;
+use Livewire\Attributes\Layout;
+use Livewire\Attributes\Locked;
+use Livewire\Attributes\Title;
+use Livewire\Volt\Component;
+
+new #[Layout('layouts.guest')] #[Title('Forgot Password - Olaer Spring Resort')] class extends Component
+{
+    public string $step = 'request';
+
+    public string $identifier = '';
+
+    #[Locked]
+    public string $resetIdentifier = '';
+
+    public string $otp = '';
+
+    public string $resetToken = '';
+
+    public string $password = '';
+
+    public string $password_confirmation = '';
+
+    public string $statusMessage = '';
+
+    #[Locked]
+    public ?string $debugOtp = null;
+
+    public function requestCode(StaffPasswordResetService $service): void
+    {
+        $this->identifier = trim($this->identifier);
+
+        $this->validate([
+            'identifier' => ['required', 'string', 'max:100'],
+        ], [
+            'identifier.required' => 'Enter your email address.',
+        ]);
+
+        $key = 'staff-password-reset:'.sha1(strtolower($this->identifier).'|'.request()->ip());
+
+        if (RateLimiter::tooManyAttempts($key, 3)) {
+            $seconds = RateLimiter::availableIn($key);
+            $this->addError('identifier', "Too many reset requests. Try again in {$seconds} seconds.");
+
+            return;
+        }
+
+        RateLimiter::hit($key, 300);
+
+        try {
+            $result = $service->requestOtp($this->identifier);
+            $this->debugOtp = app()->environment('local')
+                ? ($result['debug_otp'] ?? null)
+                : null;
+        } catch (\RuntimeException $exception) {
+            $this->addError('identifier', $exception->getMessage());
+
+            return;
+        }
+
+        $this->resetIdentifier = $this->identifier;
+        $this->step = 'verify';
+        $this->statusMessage = 'If the account is active and has a valid email address, a six-digit reset code has been sent. ';
+        $this->resetValidation();
+    }
+
+    public function verifyCode(StaffPasswordResetService $service): void
+    {
+        $this->otp = trim($this->otp);
+
+        $this->validate([
+            'resetIdentifier' => ['required', 'string', 'max:100'],
+            'otp' => ['required', 'digits:6'],
+        ]);
+
+        try {
+            $this->resetToken = $service->verifyOtp($this->resetIdentifier, $this->otp);
+        } catch (\RuntimeException $exception) {
+            $this->addError('otp', $exception->getMessage());
+
+            return;
+        }
+
+        $this->step = 'reset';
+        $this->statusMessage = 'Code verified. Create a new password.';
+        $this->resetValidation();
+    }
+
+    public function resetPassword(StaffPasswordResetService $service): void
+    {
+        $this->validate([
+            'resetIdentifier' => ['required', 'string', 'max:100'],
+            'resetToken' => ['required', 'string', 'size:64'],
+            'password' => [
+                'required',
+                'confirmed',
+                Password::min(8)->mixedCase()->numbers()->symbols(),
+            ],
+        ], [
+            'password.confirmed' => 'The password confirmation does not match.',
+        ]);
+
+        try {
+            $username = $service->resetPassword($this->resetIdentifier, $this->resetToken, $this->password);
+        } catch (\RuntimeException $exception) {
+            $this->addError('password', $exception->getMessage());
+
+            return;
+        }
+
+        $this->reset(['resetIdentifier', 'otp', 'resetToken', 'password', 'password_confirmation']);
+        $this->step = 'done';
+        $this->statusMessage = "Your password has been changed for the account \"{$username}\". You may now sign in with that username.";
+        $this->resetValidation();
+    }
+
+    public function startOver(): void
+    {
+        $this->reset([
+            'identifier',
+            'resetIdentifier',
+            'otp',
+            'resetToken',
+            'password',
+            'password_confirmation',
+            'statusMessage',
+        ]);
+        $this->step = 'request';
+        $this->resetValidation();
+    }
+};
+?>
+
+<div class="w-full max-w-md">
+    <div class="rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
+        <div class="mb-6">
+            <h1 class="text-2xl font-bold tracking-tight">Reset password</h1>
+            <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
+                Use the email address assigned to your staff account.
+            </p>
+        </div>
+
+        @if ($statusMessage !== '')
+            <div class="mb-5 rounded-lg border border-blue-200 bg-blue-50 p-3 text-sm text-blue-800 dark:border-blue-900 dark:bg-blue-950/40 dark:text-blue-200">
+                {{ $statusMessage }}
+            </div>
+        @endif
+
+        @if ($step === 'request')
+            <form wire:submit="requestCode" class="space-y-5">
+                <div>
+                    <flux:input
+                        wire:model="identifier"
+                        label="Email"
+                        autofocus
+                    />
+                </div>
+
+                <flux:button type="submit" variant="primary" class="w-full" wire:loading.attr="disabled">
+                    <span wire:loading.remove wire:target="requestCode">Send reset code</span>
+                    <span wire:loading wire:target="requestCode">Sending…</span>
+                </flux:button>
+            </form>
+        @elseif ($step === 'verify')
+            <form wire:submit="verifyCode" class="space-y-5">
+                <div>
+                        @if ($debugOtp)
+                            <div class="mt-5 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-100">
+                                Local testing code: <strong>{{ $debugOtp }}</strong>
+                            </div>
+                        @endif
+                    <flux:input
+                        wire:model="otp"
+                        label="Six-digit reset code"
+                        inputmode="numeric"
+                        autocomplete="one-time-code"
+                        maxlength="6"
+                        autofocus
+                    />
+                </div>
+
+                <flux:button type="submit" variant="primary" class="w-full" wire:loading.attr="disabled">
+                    Verify code
+                </flux:button>
+
+                <flux:button type="button" variant="subtle" class="w-full" wire:click="startOver">
+                    Start over
+                </flux:button>
+            </form>
+        @elseif ($step === 'reset')
+            <form wire:submit="resetPassword" class="space-y-5">
+                <div>
+                    <flux:input
+                        wire:model="password"
+                        type="password"
+                        label="New password"
+                        autocomplete="new-password"
+                        autofocus
+                        viewable
+                    />
+
+                    <p class="mt-1 text-xs text-zinc-500">
+                        Password must be at least 8 characters and include an uppercase letter, a lowercase letter, a number, and a special character.
+                    </p>
+
+                </div>
+
+                <flux:input
+                    wire:model="password_confirmation"
+                    type="password"
+                    label="Confirm new password"
+                    autocomplete="new-password"
+                    viewable
+                />
+
+                <flux:button type="submit" variant="primary" class="w-full" wire:loading.attr="disabled">
+                    Change password
+                </flux:button>
+            </form>
+        @else
+            <div class="space-y-4">
+                <a
+                    href="{{ route('login') }}"
+                    wire:navigate
+                    class="inline-flex w-full items-center justify-center rounded-lg bg-zinc-900 px-4 py-2.5 text-sm font-medium text-white hover:bg-zinc-800 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200"
+                >
+                    Return to login
+                </a>
+            </div>
+        @endif
+
+        @if ($step !== 'done')
+            <div class="mt-6 border-t border-zinc-200 pt-4 text-center dark:border-zinc-800">
+                <a href="{{ route('login') }}" wire:navigate class="text-sm font-medium text-zinc-700 hover:underline dark:text-zinc-300">
+                    Back to login
+                </a>
+            </div>
+        @endif
+    </div>
+</div>

@@ -1,0 +1,595 @@
+<?php
+
+use App\Models\Facility;
+use App\Services\PublicBookingSearchService;
+use App\Services\PublicBookingWorkflowService;
+use App\Services\GcashProofStorageService;
+use App\Services\DecimalMoneyService;
+use Illuminate\Support\Carbon;
+use Illuminate\Validation\ValidationException;
+use Livewire\Attributes\Layout;
+use Livewire\Attributes\Title;
+use Livewire\Volt\Component;
+use Livewire\WithFileUploads;
+
+new #[Layout('layouts.public')] #[Title('Book a Facility - Olaer Spring Resort')] class extends Component {
+
+    use \App\Concerns\HasPhilippineLocations;
+
+    public function updated(string $property): void
+    {
+        // Clear the red highlight of a field as soon as the user edits it.
+        $this->resetValidation($property);
+
+        // Capitalise first/last names and lower-case emails.
+        \App\Support\PersonInput::normalize($this, $property);
+    }
+
+    /** Error text for a required field; an empty required field only turns red (no text). */
+    public function visibleError(string $field): ?string
+    {
+        $message = $this->getErrorBag()->first($field);
+
+        if ($message === '') {
+            return null;
+        }
+
+        $value = data_get($this, $field);
+
+        return $value === null || $value === '' || $value === [] ? null : $message;
+    }
+    use WithFileUploads;
+
+    public ?int $facility_type_id = null;
+    public string $rate_type = '';
+    public string $check_in_date = '';
+    public string $check_out_date = '';
+    public string $check_in_time = '12:00';
+    public ?int $facility_id = null;
+
+    public int $total_guest_count = 1;
+    public array $extra_guests = [];
+
+    public string $first_name = '';
+    public string $middle_name = '';
+    public string $last_name = '';
+    public string $contact_no = '';
+    public string $email = '';
+    public string $province = 'Sultan Kudarat';
+    public string $city = 'Tacurong City';
+    public string $barangay = '';
+    public string $purok = '';
+
+    public string $payment_amount = '';
+    public string $reference_number = '';
+    public $proof_of_payment = null;
+
+    public ?string $error_message = null;
+
+    public function mount(): void
+    {
+        $this->check_in_date = Carbon::today()->toDateString();
+        $this->check_out_date = Carbon::tomorrow()->toDateString();
+    }
+
+    public function updatedFacilityTypeId(): void
+    {
+        $this->rate_type = '';
+        $this->facility_id = null;
+        $this->total_guest_count = 1;
+        $this->extra_guests = [];
+        $this->payment_amount = '';
+    }
+
+    public function updatedRateType(): void
+    {
+        $this->facility_id = null;
+        $this->total_guest_count = 1;
+        $this->extra_guests = [];
+        $this->payment_amount = '';
+    }
+
+    public function updatedCheckInDate(): void
+    {
+        if ($this->check_out_date <= $this->check_in_date) {
+            $this->check_out_date = Carbon::parse($this->check_in_date)->addDay()->toDateString();
+        }
+
+        $this->facility_id = null;
+        $this->payment_amount = '';
+    }
+
+    public function updatedCheckOutDate(): void
+    {
+        if ($this->check_out_date <= $this->check_in_date) {
+            $this->check_out_date = Carbon::parse($this->check_in_date)->addDay()->toDateString();
+        }
+
+        $this->facility_id = null;
+        $this->payment_amount = '';
+    }
+
+    public function updatedFacilityId(): void
+    {
+        $this->syncPaidExtraGuestRows();
+        $this->setExactPaymentAmountFromQuote();
+    }
+
+    public function updatedTotalGuestCount(): void
+    {
+        $this->syncPaidExtraGuestRows();
+        $this->setExactPaymentAmountFromQuote();
+    }
+
+    public function save(
+        GcashProofStorageService $proofStorage,
+    ): void
+    {
+        $this->error_message = null;
+        $guestCountRules = ['required', 'integer', 'min:1'];
+        $strictMaximum = $this->strictMaximum();
+
+        if ($strictMaximum !== null) {
+            $guestCountRules[] = 'max:'.$strictMaximum;
+        }
+
+        $validated = $this->validate([
+            'facility_type_id' => ['required', 'integer', 'exists:tbl_facility_type,facility_type_id'],
+            'rate_type' => ['required', 'string', 'max:50'],
+            'check_in_date' => ['required', 'date', 'after_or_equal:today'],
+            'check_out_date' => ['required', 'date', 'after:check_in_date'],
+            'check_in_time' => ['required', 'date_format:H:i'],
+            'facility_id' => ['required', 'integer', 'exists:tbl_facility,facility_id'],
+            'total_guest_count' => $guestCountRules,
+            'extra_guests' => ['array'],
+            'extra_guests.*.first_name' => ['required', 'string', 'max:50'],
+            'extra_guests.*.middle_name' => ['nullable', 'string', 'max:50'],
+            'extra_guests.*.last_name' => ['required', 'string', 'max:50'],
+            'first_name' => ['required', 'string', 'max:50'],
+            'middle_name' => ['nullable', 'string', 'max:50'],
+            'last_name' => ['required', 'string', 'max:50'],
+            'contact_no' => ['required', 'string', 'max:11'],
+            'email' => ['required', 'email', 'max:100', 'regex:/^[A-Za-z0-9]+(?:[._%+-][A-Za-z0-9]+)*@(?:[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*\.)+[A-Za-z]{2,}$/'],
+            'province' => ['required', 'string', 'max:50'],
+            'city' => ['required', 'string', 'max:50'],
+            'barangay' => ['nullable', 'string', 'max:50'],
+            'purok' => ['nullable', 'string', 'max:50'],
+            'payment_amount' => ['required', 'numeric', 'min:1'],
+            'reference_number' => ['required', 'string', 'max:50'],
+            'proof_of_payment' => ['required', 'file', 'mimes:jpg,jpeg,png,pdf', 'max:4096'],
+        ]);
+
+        $this->syncPaidExtraGuestRows();
+
+        $quote = $this->quotePreview();
+
+        if (! $quote) {
+            throw ValidationException::withMessages([
+                'facility_id' => 'Please select an available facility first.',
+            ]);
+        }
+
+        if (! app(DecimalMoneyService::class)->equals($this->payment_amount, $quote['total'])) {
+            throw ValidationException::withMessages([
+                'payment_amount' => 'Online booking requires exact full GCash payment of ₱' . number_format((float) $quote['total'], 2) . '.',
+            ]);
+        }
+
+        $proofPath = null;
+
+        try {
+            $proofPath = $proofStorage->store(
+                $this->proof_of_payment,
+            );
+
+            $booking = app(PublicBookingWorkflowService::class)
+                ->createGuestBookingWithPendingGcash([
+                    ...$validated,
+                    'proof_of_payment_path' => $proofPath,
+                ]);
+        } catch (\InvalidArgumentException $exception) {
+            if ($proofPath !== null) {
+                $proofStorage->deletePrivate($proofPath);
+            }
+
+            $this->error_message = $exception->getMessage();
+
+            return;
+        } catch (\Throwable $exception) {
+            if ($proofPath !== null) {
+                $proofStorage->deletePrivate($proofPath);
+            }
+
+            report($exception);
+
+            $this->error_message = 'The booking could not be submitted. Please try again or contact the resort.';
+
+            return;
+        }
+
+        session()->put(
+            'guest.booking_confirmation_id',
+            (int) $booking->booking_id,
+        );
+
+        $this->redirect(
+            route('guest.bookings.success'),
+            navigate: true,
+        );
+    }
+
+    public function selectedFacility(): ?Facility
+    {
+        if (! $this->facility_id) {
+            return null;
+        }
+
+        return Facility::query()
+            ->with(['facilityType', 'facilityProduct', 'prices'])
+            ->find($this->facility_id);
+    }
+
+    public function strictMaximum(): ?int
+    {
+        try {
+            return app(PublicBookingSearchService::class)
+                ->strictMaximum($this->facility_id);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    public function occupancyPreview(): ?array
+    {
+        try {
+            return app(PublicBookingSearchService::class)
+                ->occupancyPreview(
+                    $this->facility_id,
+                    $this->total_guest_count,
+                );
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    public function quotePreview(): ?array
+    {
+        try {
+            return app(PublicBookingSearchService::class)->quotePreview(
+                facilityId: $this->facility_id,
+                rateType: $this->rate_type,
+                totalGuestCount: $this->total_guest_count,
+            );
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    public function with(): array
+    {
+        $search = app(PublicBookingSearchService::class);
+
+        return [
+            'facilityTypes' => $search->facilityTypes(),
+            'rateTypes' => $search->rateTypesForFacilityType($this->facility_type_id),
+            'availableFacilities' => $search->availableFacilities(
+                $this->facility_type_id,
+                $this->rate_type,
+                $this->check_in_date,
+                $this->check_out_date,
+            ),
+            'selectedFacility' => $this->selectedFacility(),
+            'strictMaximum' => $this->strictMaximum(),
+            'occupancy' => $this->occupancyPreview(),
+            'quote' => $this->quotePreview(),
+        ];
+    }
+
+    private function syncPaidExtraGuestRows(): void
+    {
+        $occupancy = $this->occupancyPreview();
+
+        if ($this->facility_id !== null && $occupancy === null) {
+            return;
+        }
+
+        $count = (int) (
+            $occupancy['paid_extra_guest_count']
+            ?? 0
+        );
+        $current = $this->extra_guests;
+        $rows = [];
+
+        for ($i = 0; $i < $count; $i++) {
+            $rows[$i] = $current[$i] ?? [
+                'first_name' => '',
+                'middle_name' => '',
+                'last_name' => '',
+            ];
+        }
+
+        $this->extra_guests = $rows;
+    }
+
+    private function setExactPaymentAmountFromQuote(): void
+    {
+        $quote = $this->quotePreview();
+
+        if ($quote) {
+            $this->payment_amount = $quote['total'];
+        }
+    }
+};
+?>
+
+    <section class="mx-auto max-w-7xl px-4 py-10 sm:px-6 lg:px-8">
+        <div class="mb-8 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+            <div>
+                <p class="text-sm font-semibold uppercase tracking-wide text-emerald-600">Olaer Spring Resort</p>
+                <h1 class="mt-2 text-3xl font-bold tracking-tight text-zinc-950 dark:text-white">Book a facility</h1>
+                <p class="mt-2 max-w-3xl text-sm leading-6 text-zinc-600 dark:text-zinc-300">
+                    Booking requires full GCash payment. The submitted proof will be reviewed by the cashier before the booking is treated as fully paid.
+                </p>
+            </div>
+            <a href="{{ route('guest.home') }}" class="text-sm font-medium text-emerald-700 hover:underline dark:text-emerald-400">Back to homepage</a>
+        </div>
+
+        @if ($error_message)
+            <div class="mb-6 rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-200">
+                {{ $error_message }}
+            </div>
+        @endif
+
+        <form wire:submit="save" novalidate class="grid gap-6 lg:grid-cols-[minmax(0,1fr)_380px]">
+            <div class="space-y-6">
+                <div class="rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
+                    <h2 class="text-lg font-semibold text-zinc-950 dark:text-white">1. Choose schedule and facility</h2>
+
+                    <div class="mt-5 grid gap-4 md:grid-cols-2">
+                        <flux:field class="relative">
+                            <flux:label>Check-in date <span class="text-red-500">*</span></flux:label>
+                            <flux:input wire:model.live="check_in_date" type="date" :invalid="$errors->has('check_in_date')" />
+                            @if ($msg = $this->visibleError('check_in_date'))
+                                <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $msg }}</p>
+                            @endif
+                        </flux:field>
+                        <flux:field class="relative">
+                            <flux:label>Check-out date <span class="text-red-500">*</span></flux:label>
+                            <flux:input wire:model.live="check_out_date" type="date" :invalid="$errors->has('check_out_date')" />
+                            @if ($msg = $this->visibleError('check_out_date'))
+                                <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $msg }}</p>
+                            @endif
+                        </flux:field>
+                        <flux:field class="relative">
+                            <flux:label>Expected check-in time <span class="text-red-500">*</span></flux:label>
+                            <flux:input wire:model="check_in_time" type="time" :invalid="$errors->has('check_in_time')" />
+                            @if ($msg = $this->visibleError('check_in_time'))
+                                <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $msg }}</p>
+                            @endif
+                        </flux:field>
+
+                        <div>
+                            <label class="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Facility type <span class="text-red-500">*</span></label>
+                            <select wire:model.live="facility_type_id" class="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-700 dark:bg-zinc-950 dark:text-white{{ $errors->has('facility_type_id') ? ' !border-red-500 !ring-1 !ring-red-500' : '' }}">
+                                <option value="">Select type</option>
+                                @foreach ($facilityTypes as $type)
+                                    <option value="{{ $type->facility_type_id }}">{{ $type->facility_type }}</option>
+                                @endforeach
+                            </select>
+                            @if ($message = $this->visibleError('facility_type_id')) <p class="mt-1 text-sm text-red-600">{{ $message }}</p> @endif
+                        </div>
+
+                        <div>
+                            <label class="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Rate type <span class="text-red-500">*</span></label>
+                            <select wire:model.live="rate_type" class="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-700 dark:bg-zinc-950 dark:text-white{{ $errors->has('rate_type') ? ' !border-red-500 !ring-1 !ring-red-500' : '' }}">
+                                <option value="">Select rate</option>
+                                @foreach ($rateTypes as $rate)
+                                    <option value="{{ $rate }}">{{ $rate }}</option>
+                                @endforeach
+                            </select>
+                            @if ($message = $this->visibleError('rate_type')) <p class="mt-1 text-sm text-red-600">{{ $message }}</p> @endif
+                        </div>
+
+                        <div>
+                            <label class="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Available facility <span class="text-red-500">*</span></label>
+                            <select wire:model.live="facility_id" class="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-700 dark:bg-zinc-950 dark:text-white{{ $errors->has('facility_id') ? ' !border-red-500 !ring-1 !ring-red-500' : '' }}">
+                                <option value="">Select facility</option>
+                                @foreach ($availableFacilities as $facility)
+                                    <option value="{{ $facility->facility_id }}">
+                                        {{ $facility->facility_name }} — {{ $facility->facility_size }} — {{ $facility->facilityProduct?->strict_maximum ? 'maximum' : 'recommended' }} {{ $facility->facilityProduct?->strict_maximum ?? $facility->facilityProduct?->suggested_maximum ?? $facility->capacity }} guests
+                                    </option>
+                                @endforeach
+                            </select>
+                            @if ($message = $this->visibleError('facility_id')) <p class="mt-1 text-sm text-red-600">{{ $message }}</p> @endif
+                            @if ($facility_type_id && $rate_type && $check_in_date && $check_out_date && $availableFacilities->isEmpty())
+                                <p class="mt-2 text-sm text-amber-600">No available facility matches this date and rate. Try another date or rate type.</p>
+                            @endif
+                        </div>
+                    </div>
+                </div>
+
+                <div class="rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
+                    <h2 class="text-lg font-semibold text-zinc-950 dark:text-white">2. Guest allocation</h2>
+                    <p class="mt-1 text-sm text-zinc-600 dark:text-zinc-300">
+                        Rooms have a strict maximum and require names for paid extra occupants. Cottage and function-hall capacities are recommendations only.
+                    </p>
+
+                    <div class="mt-5 max-w-sm">
+                        <flux:input wire:model.live="total_guest_count" type="number" min="1" max="{{ $strictMaximum }}" label="Total guests, including primary guest" />
+                        @error('total_guest_count') <p class="mt-1 text-sm text-red-600">{{ $message }}</p> @enderror
+
+                        @if ($occupancy)
+                            <p class="mt-2 text-xs text-zinc-500">
+                                @if ($occupancy['strict_maximum'])
+                                    Maximum {{ $occupancy['strict_maximum'] }} guests · Included {{ $occupancy['included_guest_count'] }} · Paid room extras {{ $occupancy['paid_extra_guest_count'] }}
+                                @else
+                                    Recommended capacity: {{ $occupancy['suggested_minimum'] ? $occupancy['suggested_minimum'].'–' : '' }}{{ $occupancy['suggested_maximum'] }} guests (informational)
+                                @endif
+                            </p>
+                        @endif
+                    </div>
+
+                    @if ($extra_guests !== [])
+                        <div class="mt-5 grid gap-4">
+                            @foreach ($extra_guests as $index => $extraGuest)
+                                <div wire:key="booking-extra-guest-{{ $index }}" class="grid gap-3 rounded-xl border border-zinc-200 p-4 dark:border-zinc-800 md:grid-cols-3">
+                                    <flux:field class="relative">
+                                        <flux:label>Extra guest {{ $index + 1 }} first name <span class="text-red-500">*</span></flux:label>
+                                        <flux:input wire:model="extra_guests.{{ $index }}.first_name" :invalid="$errors->has('extra_guests.'.$index.'.first_name')" />
+                                        @if ($msg = $this->visibleError('extra_guests.'.$index.'.first_name'))
+                                            <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $msg }}</p>
+                                        @endif
+                                    </flux:field>
+                                    <flux:input wire:model="extra_guests.{{ $index }}.middle_name" label="Middle name" />
+                                    <flux:field class="relative">
+                                        <flux:label>Last name <span class="text-red-500">*</span></flux:label>
+                                        <flux:input wire:model="extra_guests.{{ $index }}.last_name" :invalid="$errors->has('extra_guests.'.$index.'.last_name')" />
+                                        @if ($msg = $this->visibleError('extra_guests.'.$index.'.last_name'))
+                                            <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $msg }}</p>
+                                        @endif
+                                    </flux:field>
+                                </div>
+                            @endforeach
+                        </div>
+                    @endif
+                </div>
+
+                <div class="rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
+                    <h2 class="text-lg font-semibold text-zinc-950 dark:text-white">3. Guest details</h2>
+
+                    <div class="mt-5 grid gap-4 md:grid-cols-3">
+                        <flux:field class="relative">
+                            <flux:label>First name <span class="text-red-500">*</span></flux:label>
+                            <flux:input wire:model="first_name" :invalid="$errors->has('first_name')" />
+                            @if ($msg = $this->visibleError('first_name'))
+                                <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $msg }}</p>
+                            @endif
+                        </flux:field>
+                        <flux:field class="relative">
+                            <flux:label>Middle name</flux:label>
+                            <flux:input wire:model="middle_name" />
+                        </flux:field>
+                        <flux:field class="relative">
+                            <flux:label>Last name <span class="text-red-500">*</span></flux:label>
+                            <flux:input wire:model="last_name" :invalid="$errors->has('last_name')" />
+                            @if ($msg = $this->visibleError('last_name'))
+                                <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $msg }}</p>
+                            @endif
+                        </flux:field>
+                    </div>
+                    <div class="mt-4 grid gap-4 md:grid-cols-2">
+                        <flux:field class="relative">
+                            <flux:label>Contact number <span class="text-red-500">*</span></flux:label>
+                            <flux:input wire:model="contact_no" maxlength="11" :invalid="$errors->has('contact_no')" />
+                            @if ($msg = $this->visibleError('contact_no'))
+                                <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $msg }}</p>
+                            @endif
+                        </flux:field>
+                        <flux:field class="relative">
+                            <flux:label>Email <span class="text-red-500">*</span></flux:label>
+                            <flux:input wire:model="email" type="email" :invalid="$errors->has('email')" />
+                            @if ($msg = $this->visibleError('email'))
+                                <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $msg }}</p>
+                            @endif
+                        </flux:field>
+                    </div>
+                    <div class="mt-4 grid gap-4 md:grid-cols-3">
+                        <x-ph-province-select :options="$this->provinceOptions()" :error="$this->visibleError('province')" />
+                        <x-ph-city-select :options="$this->cityOptions()" :error="$this->visibleError('city')" :enabled="$province !== ''" :listed="count($this->provinceOptions()) > 0" label="City" />
+                        <x-ph-barangay-select :options="$this->barangayOptions()" :error="$this->visibleError('barangay')" :enabled="$city !== ''" :listed="count($this->provinceOptions()) > 0" />
+                        <flux:field class="relative">
+                            <flux:label>Purok / Street</flux:label>
+                            <flux:input wire:model="purok" />
+                        </flux:field>
+                    </div>
+                </div>
+
+                <div class="rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
+                    <h2 class="text-lg font-semibold text-zinc-950 dark:text-white">4. GCash payment</h2>
+                    <p class="mt-1 text-sm text-zinc-600 dark:text-zinc-300">
+                        Enter the exact amount and upload your payment proof. The cashier will verify it before check-in.
+                    </p>
+
+                    <div class="mt-5 grid gap-4 md:grid-cols-2">
+                        <flux:field class="relative">
+                            <flux:label>GCash amount paid <span class="text-red-500">*</span></flux:label>
+                            <flux:input wire:model="payment_amount" type="number" step="0.01" min="1" :invalid="$errors->has('payment_amount')" />
+                            @if ($msg = $this->visibleError('payment_amount'))
+                                <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $msg }}</p>
+                            @endif
+                        </flux:field>
+                        <flux:field class="relative">
+                            <flux:label>GCash reference number <span class="text-red-500">*</span></flux:label>
+                            <flux:input wire:model="reference_number" :invalid="$errors->has('reference_number')" />
+                            @if ($msg = $this->visibleError('reference_number'))
+                                <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $msg }}</p>
+                            @endif
+                        </flux:field>
+                    </div>
+
+                    <div class="mt-4">
+                        <label class="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Proof of payment <span class="text-red-500">*</span></label>
+                        <input wire:model="proof_of_payment" type="file" accept="image/jpeg,image/png,application/pdf" class="block w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-700 dark:bg-zinc-950 dark:text-white{{ $errors->has('proof_of_payment') ? ' !border-red-500 ' : '' }}" />
+                        <p class="mt-1 text-xs text-zinc-500">Accepted: JPG, PNG, PDF. Maximum 4 MB.</p>
+                        <div wire:loading wire:target="proof_of_payment" class="mt-2 text-sm text-zinc-500">Uploading...</div>
+                        @if ($message = $this->visibleError('proof_of_payment')) <p class="mt-1 text-sm text-red-600">{{ $message }}</p> @endif
+                    </div>
+                </div>
+            </div>
+
+            <div class="sticky top-6 h-fit rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
+                <h2 class="text-lg font-semibold text-zinc-950 dark:text-white">Booking summary</h2>
+
+                @if ($selectedFacility)
+                    <div class="mt-4 space-y-3 text-sm">
+                        <div class="flex justify-between gap-4">
+                            <span class="text-zinc-500">Facility</span>
+                            <span class="font-medium text-zinc-950 dark:text-white">{{ $selectedFacility->facility_name }}</span>
+                        </div>
+                        <div class="flex justify-between gap-4">
+                            <span class="text-zinc-500">Type</span>
+                            <span class="font-medium text-zinc-950 dark:text-white">{{ optional($selectedFacility->facilityType)->facility_type }}</span>
+                        </div>
+                        <div class="flex justify-between gap-4">
+                            <span class="text-zinc-500">{{ $selectedFacility->facilityProduct?->strict_maximum ? 'Maximum' : 'Recommended capacity' }}</span>
+                            <span class="font-medium text-zinc-950 dark:text-white">{{ $selectedFacility->facilityProduct?->strict_maximum ?? $selectedFacility->facilityProduct?->suggested_maximum ?? $selectedFacility->capacity }} guests</span>
+                        </div>
+                        <div class="flex justify-between gap-4">
+                            <span class="text-zinc-500">Schedule</span>
+                            <span class="font-medium text-zinc-950 dark:text-white">{{ $check_in_date }} to {{ $check_out_date }}</span>
+                        </div>
+                    </div>
+                @else
+                    <p class="mt-4 text-sm text-zinc-500">Select a facility to see the quote.</p>
+                @endif
+
+                @if ($quote)
+                    <div class="mt-6 rounded-xl bg-zinc-50 p-4 text-sm text-zinc-700 dark:bg-zinc-950 dark:text-zinc-300">
+                        <div class="flex justify-between">
+                            <span>Base price</span>
+                            <span>₱{{ number_format((float) $quote['base_price'], 2) }}</span>
+                        </div>
+                        <div class="mt-2 flex justify-between">
+                            <span>Extra guest fee</span>
+                            <span>₱{{ number_format((float) $quote['extra_guest_fee'], 2) }}</span>
+                        </div>
+                        <div class="mt-3 border-t border-zinc-200 pt-3 text-base font-semibold dark:border-zinc-800">
+                            <div class="flex justify-between">
+                                <span>Total</span>
+                                <span>₱{{ number_format((float) $quote['total'], 2) }}</span>
+                            </div>
+                        </div>
+                    </div>
+                @endif
+
+                <flux:button type="submit" variant="primary" class="mt-6 w-full" wire:loading.attr="disabled" wire:target="save">
+                    <span wire:loading.remove wire:target="save">Submit booking</span>
+                    <span wire:loading wire:target="save">Submitting booking...</span>
+                </flux:button>
+
+                <p class="mt-3 text-xs leading-5 text-zinc-500">
+                    Submission creates a pending booking. It blocks the selected facility from conflicting bookings while the cashier reviews your proof.
+                </p>
+            </div>
+        </form>
+    </section>

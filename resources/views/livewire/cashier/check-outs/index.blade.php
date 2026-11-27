@@ -1,0 +1,1193 @@
+<?php
+
+use App\Models\Booking;
+use App\Models\BookingDetail;
+use App\Models\FacilityInspection;
+use App\Models\FacilityConditionPhoto;
+use App\Models\FacilityInspectionPhoto;
+use App\Models\FacilityInspectionRequest;
+use App\Models\GuestFine;
+use App\Models\ModeOfPayment;
+use App\Services\CheckOutWorkflowService;
+use App\Services\CheckOutInspectionRequestService;
+use App\Services\OutstandingBreakdownService;
+use App\Services\PaymentWorkflowService;
+use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Pagination\LengthAwarePaginator;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\DB;
+use Livewire\Attributes\Layout;
+use Livewire\Attributes\Title;
+use Livewire\Attributes\Url;
+use Livewire\Volt\Component;
+use Livewire\WithPagination;
+
+new #[Layout('layouts.app')] #[Title('Cashier Check-out - Olaer Spring Resort')] class extends Component
+{
+    use WithPagination;
+
+    #[Url(as: 'q', except: '')]
+    public string $search = '';
+
+    #[Url(as: 'list', except: 'all')]
+    public string $statusFilter = 'all';
+
+    #[Url(as: 'stage', except: 'all')]
+    public string $stageFilter = 'all';
+
+    #[Url(as: 'departure', except: 'today')]
+    public string $dateFilter = 'today';
+
+    #[Url(as: 'sort', except: 'check_out_date')]
+    public string $sortField = 'check_out_date';
+
+    #[Url(as: 'direction', except: 'asc')]
+    public string $sortDirection = 'asc';
+
+    #[Url(as: 'per_page', except: 10)]
+    public int $perPage = 10;
+
+    public ?int $selectedBookingDetailsId = null;
+    public ?int $selectedBookingId = null;
+    public string $selectedLabel = '';
+    public float $selectedBookingAmountDue = 0.00;
+    public bool $showCheckOutPanel = false;
+
+    public bool $showSettleModal = false;
+    public string $settleAmount = '';
+    public string $settleModeId = '';
+    public string $settleReference = '';
+    public string $settleCashPaid = '';
+    public ?int $settledPaymentId = null;
+    // Inline "are you sure" step inside the check-out modal (no nested modal).
+    public bool $showCheckOutDialog = false;
+
+    public function mount(): void
+    {
+        $bookingId = request()->integer('booking');
+
+        if ($bookingId <= 0) {
+            return;
+        }
+
+        $checkedInDetails = BookingDetail::query()
+            ->with('booking')
+            ->where('booking_id', $bookingId)
+            ->where('status', 'Checked-in')
+            ->whereHas('booking', function ($query): void {
+                $query->whereNotIn('status', ['Cancelled', 'Checked-out']);
+            })
+            ->get();
+
+        $bookingReference = $checkedInDetails->first()?->booking?->b_ref_no;
+
+        if (filled($bookingReference)) {
+            $this->search = (string) $bookingReference;
+        }
+
+        if ($checkedInDetails->count() === 1) {
+            $this->selectCheckOut((int) $checkedInDetails->first()->booking_details_id);
+        }
+    }
+
+    public function with(): array
+    {
+        return [
+            'bookingDetails' => $this->bookingDetails(),
+            'selectedGuestFines' => $this->selectedGuestFines(),
+            'selectedInspection' => $this->selectedInspection(),
+            'selectedInspectionRequest' => $this->selectedInspectionRequest(),
+            'inspectionPhotos' => $this->inspectionPhotos(),
+            'conditionPhotos' => $this->conditionPhotos(),
+            'settleModes' => $this->showSettleModal
+                ? ModeOfPayment::query()->orderBy('mode_of_payment')->get()
+                : collect(),
+            'settleBreakdown' => $this->settleBreakdown(),
+        ];
+    }
+
+    public function updatedSearch(): void
+    {
+        $this->resetPage();
+    }
+
+    public function updatedStatusFilter(): void
+    {
+        $this->cancelSelection();
+
+        if ($this->statusFilter === 'checked_out') {
+            $this->stageFilter = 'all';
+        }
+
+        $this->resetPage();
+    }
+
+    public function updatedStageFilter(): void
+    {
+        $this->cancelSelection();
+        $this->resetPage();
+    }
+
+    public function updatedDateFilter(): void
+    {
+        $this->cancelSelection();
+        $this->resetPage();
+    }
+
+    public function updatedPerPage(): void
+    {
+        if (! in_array($this->perPage, [10, 25, 50, 100], true)) {
+            $this->perPage = 10;
+        }
+
+        $this->resetPage();
+    }
+
+    public function clearFilters(): void
+    {
+        $this->search = '';
+        $this->statusFilter = 'all';
+        $this->stageFilter = 'all';
+        $this->dateFilter = 'all';
+        $this->sortField = 'check_out_date';
+        $this->sortDirection = 'asc';
+        $this->perPage = 10;
+        $this->cancelSelection();
+
+        $this->resetPage();
+    }
+
+    public function refreshSelectedState(): void
+    {
+        if ($this->selectedBookingDetailsId === null) {
+            return;
+        }
+
+        $detail = BookingDetail::query()
+            ->with(['booking.guest', 'facility'])
+            ->find($this->selectedBookingDetailsId);
+
+        if ($detail === null) {
+            $this->cancelSelection();
+            return;
+        }
+
+        $guest = $detail->booking?->guest;
+        $facilityName = $detail->facility?->facility_name ?? 'No facility';
+
+        $this->selectedBookingId = (int) $detail->booking_id;
+        $this->selectedBookingAmountDue =
+            (float) ($detail->booking?->amount_due ?? 0);
+
+        $this->selectedLabel =
+            ($detail->booking?->b_ref_no ?? 'Unknown booking')
+            .' - '
+            .trim(($guest?->first_name ?? '').' '.($guest?->last_name ?? ''))
+            .' - '
+            .$facilityName;
+    }
+
+    public function sortBy(string $field): void
+    {
+        $allowed = ['b_ref_no', 'guest_name', 'facility_name', 'check_in_date', 'check_out_date', 'amount_due', 'status'];
+
+        if (! in_array($field, $allowed, true)) {
+            return;
+        }
+
+        if ($this->sortField === $field) {
+            $this->sortDirection = $this->sortDirection === 'asc' ? 'desc' : 'asc';
+        } else {
+            $this->sortField = $field;
+            $this->sortDirection = 'asc';
+        }
+
+        $this->resetPage();
+    }
+
+    public function selectCheckOut(int $bookingDetailsId): void
+    {
+        $detail = BookingDetail::query()
+            ->with(['booking.guest', 'facility'])
+            ->find($bookingDetailsId);
+
+        if (! $detail?->booking?->guest) {
+            $this->cancelSelection();
+            $this->showCheckOutDialog = false;
+            $this->addError('checkOut', 'This check-out is no longer available. Refresh the list and try again.');
+
+            return;
+        }
+
+        $guest = $detail->booking->guest;
+        $facilityName = $detail->facility !== null ? $detail->facility->facility_name : 'No facility';
+
+        $this->selectedBookingDetailsId = $bookingDetailsId;
+        $this->selectedBookingId = (int) $detail->booking_id;
+        $this->selectedBookingAmountDue = (float) $detail->booking->amount_due;
+        $this->selectedLabel = $detail->booking->b_ref_no . ' - ' . $guest->first_name . ' ' . $guest->last_name . ' - ' . $facilityName;
+        $this->resetErrorBag('checkOut');
+        $this->settledPaymentId = null;
+        $this->showCheckOutDialog = false;
+        $this->showCheckOutPanel = true;
+    }
+
+    public function cancelSelection(): void
+    {
+        $this->closeSettlePayment();
+        $this->settledPaymentId = null;
+        $this->showCheckOutPanel = false;
+        $this->showCheckOutDialog = false;
+        $this->selectedBookingDetailsId = null;
+        $this->selectedBookingId = null;
+        $this->selectedLabel = '';
+        $this->selectedBookingAmountDue = 0.00;
+    }
+
+
+    public function sendInspectionRequest(CheckOutInspectionRequestService $inspectionRequestService): void
+    {
+        $validated = $this->validate([
+            'selectedBookingDetailsId' => ['required', 'integer', 'exists:tbl_booking_details,booking_details_id'],
+        ]);
+
+        try {
+            $inspectionRequestService->requestInspection(
+                (int) $validated['selectedBookingDetailsId'],
+                (int) Auth::id()
+            );
+
+            $this->refreshSelectedState();
+
+            session()->flash('success', 'Inspection request sent to maintenance.');
+        } catch (\Illuminate\Validation\ValidationException $exception) {
+            $this->addError('checkOut', (string) collect($exception->errors())->flatten()->first());
+        } catch (\InvalidArgumentException $exception) {
+            $this->addError('checkOut', $exception->getMessage());
+        } catch (\Throwable $exception) {
+            report($exception);
+            $this->addError('checkOut', 'The inspection request could not be sent. Refresh and try again.');
+        }
+    }
+
+    public function requestCheckOut(): void
+    {
+        if ($this->selectedBookingDetailsId === null) {
+            return;
+        }
+
+        $this->showCheckOutDialog = true;
+    }
+
+    public function confirmCheckOut(CheckOutWorkflowService $checkOutWorkflow): void
+    {
+        $validated = $this->validate([
+            'selectedBookingDetailsId' => ['required', 'integer', 'exists:tbl_booking_details,booking_details_id'],
+        ]);
+
+        try {
+            $checkOutWorkflow->checkOutBookingDetail(
+                (int) $validated['selectedBookingDetailsId'],
+                (int) Auth::id()
+            );
+
+            $this->showCheckOutDialog = false;
+            $this->cancelSelection();
+            $this->resetPage();
+            session()->flash('success', 'Guest checked out successfully. Facility is now available.');
+        } catch (\Illuminate\Validation\ValidationException $exception) {
+            $this->addError('checkOut', (string) collect($exception->errors())->flatten()->first());
+        } catch (\InvalidArgumentException $exception) {
+            $this->addError('checkOut', $exception->getMessage());
+        } catch (\Throwable $exception) {
+            report($exception);
+            $this->addError('checkOut', 'Check-out could not be completed. Refresh the list and try again.');
+        }
+    }
+
+    /** Unpaid parts of the booking (facility, amenities, fines and other bills). */
+    public function settleBreakdown(): ?array
+    {
+        if (! $this->showSettleModal || $this->selectedBookingId === null) {
+            return null;
+        }
+
+        try {
+            return app(OutstandingBreakdownService::class)->for('booking', $this->selectedBookingId);
+        } catch (\Throwable $exception) {
+            report($exception);
+
+            return null;
+        }
+    }
+
+    public function openSettlePayment(): void
+    {
+        $booking = $this->selectedBookingId !== null
+            ? Booking::query()->find($this->selectedBookingId)
+            : null;
+
+        if ($booking === null || (float) $booking->amount_due <= 0) {
+            $this->refreshSelectedState();
+            $this->addError('checkOut', 'This booking has no unpaid balance.');
+
+            return;
+        }
+
+        $this->settleAmount = number_format((float) $booking->amount_due, 2, '.', '');
+        $this->settleModeId = (string) (ModeOfPayment::query()->orderBy('mode_of_payment_id')->value('mode_of_payment_id') ?? '');
+        $this->settleReference = '';
+        $this->settleCashPaid = '';
+        $this->settledPaymentId = null;
+        $this->resetValidation();
+        $this->showSettleModal = true;
+    }
+
+    public function closeSettlePayment(): void
+    {
+        $this->showSettleModal = false;
+        $this->settleAmount = '';
+        $this->settleModeId = '';
+        $this->settleReference = '';
+        $this->settleCashPaid = '';
+        $this->resetValidation();
+    }
+
+    public function updatedShowSettleModal(bool $open): void
+    {
+        if (! $open) {
+            $this->closeSettlePayment();
+        }
+    }
+
+    public function settleModeName(): string
+    {
+        return strtolower(trim((string) ModeOfPayment::query()
+            ->whereKey((int) $this->settleModeId)
+            ->value('mode_of_payment')));
+    }
+
+    public function updatedSettleModeId(): void
+    {
+        // Cash received only belongs to a cash payment.
+        $this->settleCashPaid = '';
+    }
+
+    public function recordSettlePayment(PaymentWorkflowService $paymentWorkflow): void
+    {
+        $isCash = $this->settleModeName() === 'cash';
+
+        $validated = $this->validate([
+            'selectedBookingId' => ['required', 'integer', 'min:1'],
+            'settleAmount' => ['required', 'numeric', 'gt:0'],
+            'settleModeId' => ['required', 'integer', 'exists:tbl_mode_of_payment,mode_of_payment_id'],
+            'settleReference' => ['nullable', 'string', 'max:50'],
+            'settleCashPaid' => [$isCash ? 'required' : 'nullable', 'numeric', 'gte:settleAmount'],
+        ], [
+            'selectedBookingId.required' => 'This booking is no longer selected. Close this window and try again.',
+            'settleAmount.required' => 'Enter the amount to pay.',
+            'settleAmount.numeric' => 'The amount to pay must be a number.',
+            'settleAmount.gt' => 'The amount to pay must be greater than zero.',
+            'settleModeId.required' => 'Choose a mode of payment.',
+            'settleCashPaid.required' => 'Enter the cash received.',
+            'settleCashPaid.numeric' => 'Cash given must be a number.',
+            'settleCashPaid.gte' => 'Cash given must be at least the amount to pay.',
+        ]);
+
+        try {
+            $payment = $paymentWorkflow->recordCashierPayment([
+                'target_type' => 'booking',
+                'target_id' => (int) $validated['selectedBookingId'],
+                'amount_paid' => $validated['settleAmount'],
+                'mode_of_payment_id' => (int) $validated['settleModeId'],
+                'reference_number' => $validated['settleReference'] ?? null,
+                'cash_paid' => $isCash ? ($validated['settleCashPaid'] ?? null) : null,
+                'user_id' => (int) Auth::id(),
+            ]);
+
+            $this->settledPaymentId = (int) $payment->payment_id;
+            $this->closeSettlePayment();
+            $this->refreshSelectedState();
+        } catch (\InvalidArgumentException $exception) {
+            $this->addError('settlePayment', $exception->getMessage());
+        } catch (\Throwable $exception) {
+            report($exception);
+            $this->addError('settlePayment', 'The payment could not be recorded. Please close this window and try again.');
+        }
+    }
+
+    public function formatFineLabel(?\App\Models\Fine $fine): string
+    {
+        if ($fine === null) {
+            return 'Unknown fine';
+        }
+
+        $charge = '₱' . number_format((float) $fine->fine_charge, 2);
+
+        if (in_array((string) $fine->fine_type, ['Amenity', 'Amenity Fine'], true)) {
+            $amenityLabel = 'Amenity';
+            $damageLabel = 'Damage';
+
+            if ($fine->amenity !== null && $fine->amenity->amenityName !== null) {
+                $amenityLabel = (string) $fine->amenity->amenityName->amenity_name;
+            }
+
+            if ($fine->damageType !== null) {
+                $damageLabel = (string) $fine->damageType->damage_type;
+            }
+
+            return $amenityLabel . ' / ' . $damageLabel . ' - ' . $charge;
+        }
+
+        return (string) $fine->situational_fine . ' - ' . $charge;
+    }
+
+    public function sortIndicator(string $field): string
+    {
+        if ($this->sortField !== $field) {
+            return '↕';
+        }
+
+        return $this->sortDirection === 'asc' ? '↑' : '↓';
+    }
+
+    public function workflowStage(BookingDetail $detail): string
+    {
+        if ($detail->status === 'Checked-out') {
+            return 'Checked-out';
+        }
+
+        $requestStatus =
+            $detail->getAttribute('latest_request_status');
+
+        $inspectionStatus =
+            $detail->getAttribute('latest_inspection_status');
+
+        if (! filled($requestStatus)) {
+            return 'Needs Inspection Request';
+        }
+
+        if ($requestStatus !== 'Completed') {
+            return 'Inspection '.$requestStatus;
+        }
+
+        if (! filled($inspectionStatus) || $inspectionStatus === 'In Progress') {
+            return 'Waiting for Inspection Result';
+        }
+
+        if ((float) $detail->booking->amount_due > 0) {
+            return 'Payment Due';
+        }
+
+        return 'Ready for Check-out';
+    }
+
+    public function workflowStageColor(string $stage): string
+    {
+        return \App\Support\StatusColor::for($stage);
+    }
+
+    private function bookingDetails(): LengthAwarePaginator
+    {
+        $query = BookingDetail::query()
+            ->select('tbl_booking_details.*')
+            ->join('tbl_booking', 'tbl_booking.booking_id', '=', 'tbl_booking_details.booking_id')
+            ->join('tbl_guest', 'tbl_guest.guest_id', '=', 'tbl_booking.guest_id')
+            ->leftJoin('tbl_facility', 'tbl_facility.facility_id', '=', 'tbl_booking_details.facility_id')
+            ->with(['booking.guest', 'facility.facilityType'])
+            ->addSelect([
+                'latest_request_status' =>
+                    FacilityInspectionRequest::query()
+                        ->select('status')
+                        ->whereColumn(
+                            'booking_details_id',
+                            'tbl_booking_details.booking_details_id',
+                        )
+                        ->latest('facility_inspection_request_id')
+                        ->limit(1),
+                // Only the inspection that belongs to the latest request counts.
+                'latest_inspection_status' =>
+                    FacilityInspection::query()
+                        ->select('inspection_status')
+                        ->whereColumn(
+                            'booking_details_id',
+                            'tbl_booking_details.booking_details_id',
+                        )
+                        ->whereRaw(
+                            'facility_inspection_request_id = (select max(r.facility_inspection_request_id) from tbl_facility_inspection_request r where r.booking_details_id = tbl_booking_details.booking_details_id)',
+                        )
+                        ->latest('facility_inspection_id')
+                        ->limit(1),
+            ]);
+        if ($this->statusFilter === 'checked_out') {
+            // History view: facilities that have already been checked out.
+            $query->where('tbl_booking_details.status', 'Checked-out');
+        } else {
+            // Check-out queue: only facilities that are actually Checked-in.
+            // Facilities still Booked (never checked in) can't be checked out,
+            // so they never appear here.
+            $query->where('tbl_booking_details.status', 'Checked-in')
+                ->whereNotIn('tbl_booking.status', ['Cancelled', 'Checked-out']);
+        }
+
+        $searchText = trim($this->search);
+
+        if ($searchText !== '') {
+            $needle = '%' . $searchText . '%';
+
+            $query->where(function ($query) use ($needle): void {
+                $query->where('tbl_booking.b_ref_no', 'like', $needle)
+                    ->orWhere('tbl_guest.first_name', 'like', $needle)
+                    ->orWhere('tbl_guest.middle_name', 'like', $needle)
+                    ->orWhere('tbl_guest.last_name', 'like', $needle)
+                    ->orWhereRaw(\App\Support\NameSearch::sql('tbl_guest.first_name', 'tbl_guest.middle_name', 'tbl_guest.last_name'), \App\Support\NameSearch::bindings($needle))
+                    ->orWhere('tbl_guest.contact_no', 'like', $needle)
+                    ->orWhere('tbl_guest.email', 'like', $needle)
+                    ->orWhere('tbl_facility.facility_name', 'like', $needle);
+            });
+        }
+
+        if ($this->dateFilter === 'today') {
+            $query->whereDate(
+                'tbl_booking_details.check_out_date',
+                now()->toDateString(),
+            );
+        } elseif ($this->dateFilter === 'upcoming') {
+            $query->whereDate(
+                'tbl_booking_details.check_out_date',
+                '>',
+                now()->toDateString(),
+            );
+        } elseif ($this->dateFilter === 'overdue') {
+            $query->whereDate(
+                'tbl_booking_details.check_out_date',
+                '<',
+                now()->toDateString(),
+            );
+        }
+
+        if (
+            $this->statusFilter !== 'checked_out'
+            && $this->stageFilter !== 'all'
+        ) {
+            // Same definition the workflow stage badge uses: the LATEST request,
+            // and an inspection result that belongs to that request.
+            $latestRequest = '(select max(r.facility_inspection_request_id) from tbl_facility_inspection_request r where r.booking_details_id = tbl_booking_details.booking_details_id)';
+            $latestCompleted = "(select r2.status from tbl_facility_inspection_request r2 where r2.facility_inspection_request_id = {$latestRequest}) = 'Completed'";
+            $resultReady = "exists (select 1 from tbl_facility_inspection i where i.booking_details_id = tbl_booking_details.booking_details_id and i.facility_inspection_request_id = {$latestRequest} and i.inspection_status <> 'In Progress')";
+
+            if ($this->stageFilter === 'needs_request') {
+                $query->whereRaw("{$latestRequest} is null");
+            } elseif ($this->stageFilter === 'waiting') {
+                $query->whereRaw("{$latestRequest} is not null")
+                    ->whereRaw("(not ({$latestCompleted}) or not {$resultReady})");
+            } elseif ($this->stageFilter === 'payment_due') {
+                $query->whereRaw($latestCompleted)
+                    ->whereRaw($resultReady)
+                    ->where('tbl_booking.amount_due', '>', 0);
+            } elseif ($this->stageFilter === 'ready') {
+                $query->whereRaw($latestCompleted)
+                    ->whereRaw($resultReady)
+                    ->where('tbl_booking.amount_due', '<=', 0);
+            }
+        }
+
+        $direction = $this->sortDirection === 'desc' ? 'desc' : 'asc';
+
+        if ($this->sortField === 'guest_name') {
+            $query->orderBy('tbl_guest.last_name', $direction)
+                ->orderBy('tbl_guest.first_name', $direction);
+        } elseif ($this->sortField === 'facility_name') {
+            $query->orderBy('tbl_facility.facility_name', $direction);
+        } else {
+            $sortMap = [
+                'b_ref_no' => 'tbl_booking.b_ref_no',
+                'check_in_date' => 'tbl_booking_details.check_in_date',
+                'check_out_date' => 'tbl_booking_details.check_out_date',
+                'amount_due' => 'tbl_booking.amount_due',
+                'status' => 'tbl_booking_details.status',
+            ];
+
+            $sortColumn = $sortMap[$this->sortField] ?? 'tbl_booking_details.check_out_date';
+            $query->orderBy($sortColumn, $direction);
+        }
+
+        $perPage = in_array($this->perPage, [10, 25, 50, 100], true)
+            ? $this->perPage
+            : 10;
+
+        return $query->paginate($perPage);
+    }
+
+    private function selectedGuestFines(): Collection
+    {
+        if ($this->selectedBookingId === null) {
+            return new Collection();
+        }
+
+        $detail = BookingDetail::query()->find($this->selectedBookingDetailsId);
+
+        if ($detail === null) {
+            return new Collection();
+        }
+
+        return GuestFine::query()
+            ->with(['fine.amenity.amenityName', 'fine.damageType', 'facility', 'reportedBy'])
+            ->where('booking_id', $this->selectedBookingId)
+            ->where('facility_id', $detail->facility_id)
+            ->latest('guest_fine_id')
+            ->get();
+    }
+
+
+    private function selectedInspectionRequest(): ?FacilityInspectionRequest
+    {
+        if ($this->selectedBookingDetailsId === null) {
+            return null;
+        }
+
+        return FacilityInspectionRequest::query()
+            ->with(['requestedBy', 'assignedTo', 'inspection'])
+            ->where('booking_details_id', $this->selectedBookingDetailsId)
+            ->latest('facility_inspection_request_id')
+            ->first();
+    }
+
+    /** Facility photos taken before this stay's check-in ("before" baseline). */
+    private function conditionPhotos(): \Illuminate\Support\Collection
+    {
+        if ($this->selectedBookingDetailsId === null) {
+            return collect();
+        }
+
+        return FacilityConditionPhoto::query()
+            ->where('booking_details_id', $this->selectedBookingDetailsId)
+            ->orderBy('facility_condition_photo_id')
+            ->get();
+    }
+
+    /** Damage photos maintenance attached to any inspection request of this stay (read-only here). */
+    private function inspectionPhotos(): \Illuminate\Support\Collection
+    {
+        if ($this->selectedBookingDetailsId === null) {
+            return collect();
+        }
+
+        return FacilityInspectionPhoto::query()
+            ->where('booking_details_id', $this->selectedBookingDetailsId)
+            ->orderBy('facility_inspection_photo_id')
+            ->get();
+    }
+
+    private function selectedInspection(): ?FacilityInspection
+    {
+        if ($this->selectedBookingDetailsId === null) {
+            return null;
+        }
+
+        return FacilityInspection::query()
+            ->with('inspectedBy')
+            ->where('booking_details_id', $this->selectedBookingDetailsId)
+            ->first();
+    }
+};
+?>
+
+<div class="space-y-6" wire:poll.10s.visible="refreshSelectedState">
+    <x-staff-page-header
+        eyebrow="Cashier operations"
+        title="Cashier Check-out"
+        description="Verify maintenance inspection and payment status before releasing the facility."
+    />
+
+    <x-toast :message="session('success')" fresh />
+
+    @if (! $showCheckOutPanel)
+    @error('checkOut')
+        <div class="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200">
+            {{ $message }}
+        </div>
+    @enderror
+    @endif
+
+    <flux:card class="overflow-hidden p-0">
+        
+            <div class="grid gap-3 border-b border-zinc-200 p-5 md:grid-cols-5 dark:border-zinc-800">
+                    <flux:input
+                        label="Search"
+                        placeholder="Reference, guest, contact, email, facility"
+                        wire:model.live.debounce.300ms="search"
+                        clearable
+                    />
+                    <flux:select
+                        label="List"
+                        wire:model.live="statusFilter"
+                    >
+                        <option value="all">Checked-in / Pending check-out</option>
+                        <option value="checked_out">Checked-out history</option>
+                    </flux:select>
+
+                    <flux:select
+                        label="Workflow stage"
+                        wire:model.live="stageFilter"
+                        :disabled="$statusFilter === 'checked_out'"
+                    >
+                        <option value="all">All </option>
+                        <option value="needs_request">Needs inspection request</option>
+                        <option value="waiting">Waiting for maintenance</option>
+                        <option value="payment_due">Inspection complete / payment due</option>
+                        <option value="ready">Ready for check-out</option>
+                    </flux:select>
+
+                    <flux:select
+                        label="Scheduled departure"
+                        wire:model.live="dateFilter"
+                    >
+                        <option value="all">All </option>
+                        <option value="today">Due today</option>
+                        <option value="upcoming">Upcoming</option>
+                        <option value="overdue">Past scheduled date</option>
+                    </flux:select>
+
+                    <div class="flex items-end gap-2">
+                    <flux:select
+                        label="Rows"
+                        wire:model.live="perPage"
+                    >
+                        <option value="10">10</option>
+                        <option value="25">25</option>
+                        <option value="50">50</option>
+                        <option value="100">100</option>
+                    </flux:select>
+
+                <flux:button type="button" wire:click="clearFilters" variant="ghost">Clear Filters</flux:button>
+                </div>
+            </div>
+        
+
+        <div class="overflow-x-auto" wire:loading.class="opacity-60" wire:target="search,statusFilter,stageFilter,dateFilter,perPage,sortBy,clearFilters">
+            <table class="w-full min-w-[78rem] text-left text-sm">
+                <thead class="border-b border-brand-border bg-zinc-50 text-xs uppercase tracking-wide text-brand-text-muted dark:border-zinc-800 dark:bg-zinc-950/60 dark:text-zinc-400">
+                    <tr>
+                        <th class="px-4 py-3">
+                            <button
+                                type="button"
+                                wire:click="sortBy('b_ref_no')"
+                                class="font-semibold transition hover:text-brand-text dark:hover:text-white"
+                            >
+                                REF {{ $this->sortIndicator('b_ref_no') }}
+                            </button>
+                        </th>
+
+                        <th class="px-4 py-3">
+                            <button
+                                type="button"
+                                wire:click="sortBy('guest_name')"
+                                class="font-semibold transition hover:text-brand-text dark:hover:text-white"
+                            >
+                                GUEST {{ $this->sortIndicator('guest_name') }}
+                            </button>
+                        </th>
+
+                        <th class="px-4 py-3">
+                            <button
+                                type="button"
+                                wire:click="sortBy('facility_name')"
+                                class="font-semibold transition hover:text-brand-text dark:hover:text-white"
+                            >
+                                FACILITY {{ $this->sortIndicator('facility_name') }}
+                            </button>
+                        </th>
+
+                        <th class="px-4 py-3">
+                            <button
+                                type="button"
+                                wire:click="sortBy('check_in_date')"
+                                class="font-semibold transition hover:text-brand-text dark:hover:text-white"
+                            >
+                                CHECK-IN {{ $this->sortIndicator('check_in_date') }}
+                            </button>
+                        </th>
+
+                        <th class="px-4 py-3">
+                            <button
+                                type="button"
+                                wire:click="sortBy('check_out_date')"
+                                class="font-semibold transition hover:text-brand-text dark:hover:text-white"
+                            >
+                                CHECK-OUT {{ $this->sortIndicator('check_out_date') }}
+                            </button>
+                        </th>
+
+                        <th class="px-4 py-3">
+                            <button
+                                type="button"
+                                wire:click="sortBy('amount_due')"
+                                class="font-semibold transition hover:text-brand-text dark:hover:text-white"
+                            >
+                                BALANCE {{ $this->sortIndicator('amount_due') }}
+                            </button>
+                        </th>
+
+                        <th class="px-4 py-3 font-semibold">Workflow Stage</th>
+                        <th class="px-4 py-3 text-right font-semibold">Actions</th>
+                    </tr>
+                </thead>
+
+                <tbody class="divide-y divide-brand-border/70 dark:divide-zinc-800">
+                    @forelse ($bookingDetails as $detail)
+                        <tr
+                            wire:key="check-out-detail-{{ $detail->booking_details_id }}"
+                            class="align-top text-brand-text transition-colors dark:text-zinc-200 {{ $selectedBookingDetailsId === (int) $detail->booking_details_id ? 'bg-blue-50 ring-1 ring-inset ring-blue-200 dark:bg-blue-950/30 dark:ring-blue-800' : 'hover:bg-brand-surface-muted/70 dark:hover:bg-zinc-800/60' }}"
+                        >
+                            <td class="px-4 py-4 font-medium">{{ $detail->booking->b_ref_no }}</td>
+                            <td class="px-4 py-4">{{ $detail->booking->guest->first_name }} {{ $detail->booking->guest->last_name }}</td>
+                            <td class="px-4 py-4">{{ $detail->facility?->facility_name ?? 'No facility' }}</td>
+                            <td class="px-4 py-4">{{ $detail->check_in_date?->format('M d, Y') }}</td>
+                            <td class="px-4 py-4">{{ $detail->check_out_date?->format('M d, Y') }}</td>
+                            <td class="px-4 py-4">₱{{ number_format((float) $detail->booking->amount_due, 2) }}</td>
+                            <td class="px-4 py-4">
+                                @php($stage = $this->workflowStage($detail))
+
+                                <flux:badge
+                                    color="{{ $this->workflowStageColor($stage) }}"
+                                    size="sm"
+                                >
+                                    {{ $stage }}
+                                </flux:badge>
+                            </td>
+                            <td class="px-4 py-4 text-right">
+                                <div class="flex justify-end">
+                                    <x-table-actions label="Actions for booking {{ $detail->booking->b_ref_no }}">
+                                        @if (Route::has('cashier.bookings.show'))
+                                            <flux:menu.item
+                                                icon="eye"
+                                                href="{{ route('cashier.bookings.show', $detail->booking_id) }}"
+                                                wire:navigate
+                                            >
+                                                View booking
+                                            </flux:menu.item>
+                                        @endif
+
+                                        <flux:menu.item
+                                            icon="clipboard-document-check"
+                                            wire:click="selectCheckOut({{ $detail->booking_details_id }})"
+                                        >
+                                            View check-out
+                                        </flux:menu.item>
+                                    </x-table-actions>
+                                </div>
+                            </td>
+                        </tr>
+                    @empty
+                        <tr>
+                            <td colspan="8" class="px-5 py-6">
+                                <x-dashboard-empty-state
+                                    title="No check-out records found"
+                                    description="No facility check-out record matches the selected search, list, workflow stage, and departure filters."
+                                    class="border-0 bg-transparent py-6 shadow-none dark:bg-transparent"
+                                />
+                            </td>
+                        </tr>
+                    @endforelse
+                </tbody>
+            </table>
+
+
+        </div>
+
+        <div class="border-t border-zinc-200 px-5 py-4 dark:border-zinc-800">
+            {{ $bookingDetails->links() }}
+        </div>
+    </flux:card>
+
+
+    <flux:modal wire:model="showCheckOutPanel" class="md:w-[48rem]">
+        <div class="space-y-5">
+            <div>
+                <flux:heading size="lg">{{ $showCheckOutDialog ? 'Confirm facility check-out' : 'Guest check-out' }}</flux:heading>
+            </div>
+
+            @error('checkOut')
+                <div class="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200">{{ $message }}</div>
+            @enderror
+
+            @if ($settledPaymentId !== null && ! $showCheckOutDialog)
+                <div class="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-green-200 bg-green-50 p-3 text-sm text-green-800 dark:border-green-900 dark:bg-green-950 dark:text-green-200">
+                    <span>
+                        Payment recorded.
+                        @if ($selectedBookingAmountDue > 0)
+                            Remaining balance: ₱{{ number_format($selectedBookingAmountDue, 2) }}.
+                        @else
+                            The balance is fully paid.
+                        @endif
+                    </span>
+                    <a href="{{ route('print.payment', $settledPaymentId) }}" target="_blank" rel="noopener" class="font-semibold underline">Print receipt</a>
+                </div>
+            @endif
+
+            @if ($showCheckOutDialog)
+                <flux:text>
+                    {{ $selectedLabel }} will be checked out and the physical facility will be released for future availability.
+                </flux:text>
+
+                <div class="flex justify-end gap-3">
+                    <flux:button type="button" variant="ghost" wire:click="$set('showCheckOutDialog', false)">Back</flux:button>
+                    <flux:button type="button" variant="primary" wire:click="confirmCheckOut">Confirm Check-out</flux:button>
+                </div>
+            @else
+                <div class="space-y-1 rounded-lg border border-zinc-200 bg-zinc-50 p-4 text-sm dark:border-zinc-800 dark:bg-zinc-900">
+                    <p>
+                        Current balance: <span class="font-semibold">₱{{ number_format($selectedBookingAmountDue, 2) }}</span>
+                    </p>
+
+                    @if ($selectedInspectionRequest === null)
+                        <p class="text-xs font-semibold text-red-700 dark:text-red-300">No inspection request has been sent yet.</p>
+                    @else
+                        <p class="text-xs text-zinc-600 dark:text-zinc-300">
+                            Inspection request: <span class="font-semibold">{{ $selectedInspectionRequest->status }}</span>
+                            requested by {{ $selectedInspectionRequest->requestedBy?->first_name }} {{ $selectedInspectionRequest->requestedBy?->last_name }}
+                            @if ($selectedInspectionRequest->requested_at)
+                                on {{ $selectedInspectionRequest->requested_at->format('M d, Y h:i A') }}
+                            @endif
+                        </p>
+                    @endif
+
+                    @if ($selectedInspection === null)
+                        <p class="text-xs font-semibold text-red-700 dark:text-red-300">Maintenance inspection result is still required before check-out.</p>
+                    @else
+                        <p class="text-xs text-zinc-600 dark:text-zinc-300">
+                            Inspection result: <span class="font-semibold">{{ $selectedInspection->inspection_status }}</span>
+                            by {{ $selectedInspection->inspectedBy?->first_name }} {{ $selectedInspection->inspectedBy?->last_name }}
+                            @if ($selectedInspection->inspected_at)
+                                on {{ $selectedInspection->inspected_at->format('M d, Y h:i A') }}
+                            @endif
+                        </p>
+                        @if ($selectedInspection->remarks)
+                            <p class="text-xs text-zinc-600 dark:text-zinc-300">Remarks: {{ $selectedInspection->remarks }}</p>
+                        @endif
+
+                    @endif
+
+                    @if ($inspectionPhotos->isNotEmpty())
+                        <div>
+                            <p class="mb-1 text-xs font-semibold text-zinc-600 dark:text-zinc-300">
+                                Damage photos from maintenance ({{ $inspectionPhotos->count() }})
+                            </p>
+                            <div class="grid grid-cols-3 gap-2 sm:grid-cols-5">
+                                @foreach ($inspectionPhotos as $photo)
+                                    <a
+                                        wire:key="checkout-photo-{{ $photo->facility_inspection_photo_id }}"
+                                        href="{{ route('facility-inspection-photos.show', $photo) }}"
+                                        target="_blank"
+                                        rel="noopener"
+                                        class="block overflow-hidden rounded-lg border border-zinc-200 dark:border-zinc-700"
+                                    >
+                                        <img
+                                            src="{{ route('facility-inspection-photos.show', [$photo, 'size' => 'thumb']) }}"
+                                            alt="{{ $photo->original_name ?? 'Damage photo' }}"
+                                            loading="lazy"
+                                            class="aspect-square w-full object-cover"
+                                        />
+                                        <span class="block px-1.5 py-1 text-[10px] leading-tight text-zinc-500 dark:text-zinc-400">{{ $photo->created_at?->format('M d, h:i A') }}@if ($photo->uploadedBy)<br>by {{ $photo->uploadedBy->full_name }}@endif</span>
+                                    </a>
+                                @endforeach
+                            </div>
+                        </div>
+                    @elseif ($selectedInspectionRequest !== null)
+                        <p class="text-xs text-zinc-500 dark:text-zinc-400">Maintenance has not attached any damage photos.</p>
+                    @endif
+
+                    @if ($conditionPhotos->isNotEmpty())
+                        <div>
+                            <p class="mb-1 text-xs font-semibold text-zinc-600 dark:text-zinc-300">
+                                Facility before check-in ({{ $conditionPhotos->count() }})
+                            </p>
+                            <div class="grid grid-cols-3 gap-2 sm:grid-cols-5">
+                                @foreach ($conditionPhotos as $photo)
+                                    <a
+                                        wire:key="checkout-before-photo-{{ $photo->facility_condition_photo_id }}"
+                                        href="{{ route('facility-condition-photos.show', $photo) }}"
+                                        target="_blank"
+                                        rel="noopener"
+                                        class="block overflow-hidden rounded-lg border border-zinc-200 dark:border-zinc-700"
+                                    >
+                                        <img
+                                            src="{{ route('facility-condition-photos.show', [$photo, 'size' => 'thumb']) }}"
+                                            alt="{{ $photo->original_name ?? 'Facility photo' }}"
+                                            loading="lazy"
+                                            class="aspect-square w-full object-cover"
+                                        />
+                                        <span class="block px-1.5 py-1 text-[10px] leading-tight text-zinc-500 dark:text-zinc-400">{{ $photo->created_at?->format('M d, h:i A') }}@if ($photo->uploadedBy)<br>by {{ $photo->uploadedBy->full_name }}@endif</span>
+                                    </a>
+                                @endforeach
+                            </div>
+                        </div>
+                    @endif
+
+                    @if ($selectedBookingAmountDue > 0)
+                        <p class="text-xs font-semibold text-red-700 dark:text-red-300">Balance includes any inspection fines and other unpaid bills. Use Settle Payment to pay it and complete check-out.</p>
+                    @endif
+                </div>
+
+                <div>
+                    <h2 class="text-sm font-semibold">Fines reported by maintenance</h2>
+                    <div class="mt-2 max-h-56 overflow-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
+                        <table class="min-w-full divide-y divide-zinc-200 text-sm dark:divide-zinc-800">
+                            <thead>
+                                <tr>
+                                    <th class="px-3 py-2 text-left">Fine</th>
+                                    <th class="px-3 py-2 text-left">Qty</th>
+                                    <th class="px-3 py-2 text-left">Charge</th>
+                                    <th class="px-3 py-2 text-left">Reported by</th>
+                                </tr>
+                            </thead>
+                            <tbody class="divide-y divide-zinc-200 dark:divide-zinc-800">
+                                @forelse ($selectedGuestFines as $guestFine)
+                                    <tr>
+                                        <td class="px-3 py-2">{{ $this->formatFineLabel($guestFine->fine) }}</td>
+                                        <td class="px-3 py-2">{{ $guestFine->quantity }}</td>
+                                        <td class="px-3 py-2">₱{{ number_format((float) $guestFine->total_charge, 2) }}</td>
+                                        <td class="px-3 py-2">{{ $guestFine->reportedBy?->first_name }} {{ $guestFine->reportedBy?->last_name }}</td>
+                                    </tr>
+                                @empty
+                                    <tr>
+                                        <td colspan="4" class="px-3 py-4 text-center text-zinc-500">No fines recorded for this facility.</td>
+                                    </tr>
+                                @endforelse
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div class="flex flex-wrap justify-end gap-2">
+                    @if ($selectedBookingId !== null && Route::has('cashier.bookings.show'))
+                        <flux:button
+                            href="{{ route('cashier.bookings.show', $selectedBookingId) }}"
+                            wire:navigate
+                            variant="ghost"
+                        >
+                            View Booking
+                        </flux:button>
+                    @endif
+
+                    @if ($selectedBookingId !== null && $selectedBookingAmountDue > 0)
+                        <flux:button type="button" variant="primary" wire:click="openSettlePayment">
+                            Settle Payment
+                        </flux:button>
+                    @endif
+
+                    @if ($selectedInspectionRequest === null)
+                        <flux:button wire:click="sendInspectionRequest">
+                            Send Inspection Request
+                        </flux:button>
+                    @elseif ($selectedInspectionRequest->status !== 'Completed')
+                        <flux:button disabled>
+                            Waiting for Maintenance
+                        </flux:button>
+                    @endif
+
+                    @if (
+                        $selectedInspectionRequest !== null
+                        && $selectedInspectionRequest->status === 'Completed'
+                        && $selectedInspection !== null
+                        && $selectedBookingAmountDue <= 0
+                    )
+                        <flux:button variant="primary" wire:click="requestCheckOut">
+                            Check-out
+                        </flux:button>
+                    @else
+                        <flux:button variant="primary" disabled>
+                            Not Ready
+                        </flux:button>
+                    @endif
+
+                    <flux:button variant="ghost" wire:click="cancelSelection">
+                        Close
+                    </flux:button>
+                </div>
+            @endif
+
+            {{-- Pays the booking's unpaid record (facility, amenities, fines and other bills) without leaving check-out --}}
+            <flux:modal wire:model="showSettleModal" class="md:w-[32rem]">
+                <form wire:submit.prevent="recordSettlePayment" novalidate class="space-y-5">
+                    <div>
+                        <flux:heading size="lg">Settle payment</flux:heading>
+                        <flux:text class="mt-1">{{ $selectedLabel }}</flux:text>
+                    </div>
+
+                    @if ($settleBreakdown && count($settleBreakdown['lines']) > 0)
+                        <div class="rounded-xl border border-zinc-200 p-3 text-sm dark:border-zinc-700">
+                            <p class="mb-2 text-xs font-semibold uppercase tracking-wide text-zinc-500">Unpaid breakdown</p>
+                            <div class="space-y-2">
+                                @foreach ($settleBreakdown['lines'] as $line)
+                                    <div class="flex items-start justify-between gap-3" wire:key="settle-line-{{ $loop->index }}">
+                                        <div>
+                                            <p class="font-medium">{{ $line['label'] }}</p>
+                                            <p class="text-xs text-zinc-500">
+                                                {{ $line['group'] }}@if ($line['detail']) · {{ $line['detail'] }}@endif
+                                                @if ((float) $line['paid'] > 0) · ₱{{ number_format((float) $line['paid'], 2) }} of ₱{{ number_format((float) $line['amount'], 2) }} paid @endif
+                                            </p>
+                                        </div>
+                                        <span class="whitespace-nowrap font-semibold">₱{{ number_format((float) $line['remaining'], 2) }}</span>
+                                    </div>
+                                @endforeach
+                            </div>
+                            <div class="mt-3 flex justify-between border-t border-zinc-200 pt-2 font-semibold dark:border-zinc-700">
+                                <span>Total unpaid</span>
+                                <span>₱{{ number_format((float) $settleBreakdown['balance'], 2) }}</span>
+                            </div>
+                        </div>
+                    @endif
+
+                    @error('settlePayment')
+                        <div class="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200">{{ $message }}</div>
+                    @enderror
+                    @error('selectedBookingId')
+                        <div class="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200">{{ $message }}</div>
+                    @enderror
+
+
+                    <flux:field class="relative">
+                        <flux:label>Mode of payment <span class="text-red-500">*</span></flux:label>
+                        <flux:select wire:model.live="settleModeId" :invalid="$errors->has('settleModeId')">
+                            @foreach ($settleModes as $mode)
+                                <option value="{{ $mode->mode_of_payment_id }}">{{ $mode->mode_of_payment }}</option>
+                            @endforeach
+                        </flux:select>
+                        @error('settleModeId')
+                            <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $message }}</p>
+                        @enderror
+                    </flux:field>
+
+                    @if ($this->settleModeName() === 'gcash')
+                        <flux:input wire:model="settleReference" label="GCash reference number" placeholder="Required for GCash" />
+                    @endif
+
+                    @error('settleReference')
+                        <p class="text-sm text-red-600">{{ $message }}</p>
+                    @enderror
+
+                    @if ($this->settleModeName() === 'cash')
+                        <flux:field class="relative">
+                            <flux:label>Cash given <span class="text-red-500">*</span></flux:label>
+                            <flux:input wire:model.live.debounce.300ms="settleCashPaid" type="number" min="0" step="0.01" :invalid="$errors->has('settleCashPaid')" />
+                            @error('settleCashPaid')
+                                <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $message }}</p>
+                            @enderror
+                        </flux:field>
+                        <div class="flex justify-between rounded-xl bg-zinc-50 px-4 py-3 text-sm font-semibold dark:bg-zinc-900">
+                            <span>Change</span>
+                            <span>₱{{ number_format(is_numeric($settleCashPaid) && is_numeric($settleAmount) ? max(0, (float) $settleCashPaid - (float) $settleAmount) : 0, 2) }}</span>
+                        </div>
+                    @endif
+
+                    <div class="flex justify-end gap-3">
+                        <flux:button type="button" variant="ghost" wire:click="closeSettlePayment">Cancel</flux:button>
+                        <flux:button type="submit" variant="primary">Record Payment</flux:button>
+                    </div>
+                </form>
+            </flux:modal>
+        </div>
+    </flux:modal>
+</div>

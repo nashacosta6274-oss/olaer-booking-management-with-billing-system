@@ -1,0 +1,156 @@
+<?php
+
+use App\Models\RefundRequest;
+use App\Services\CashierAlertCountService;
+use App\Services\RealtimeDashboardService;
+use App\Services\SecurityDashboardService;
+use Livewire\Volt\Component;
+
+new class extends Component
+{
+    public string $roleName = '';
+
+    /**
+     * @var array<string, int|float>
+     */
+    public array $counts = [];
+
+    public function mount(
+        RealtimeDashboardService $realtimeDashboard,
+        SecurityDashboardService $securityDashboard,
+        CashierAlertCountService $cashierAlerts,
+    ): void {
+        $user = auth()->user();
+        $user?->loadMissing('role');
+
+        $this->roleName = (string) ($user?->role?->role_name ?? '');
+
+        $this->loadCounts(
+            $realtimeDashboard,
+            $securityDashboard,
+            $cashierAlerts,
+        );
+    }
+
+    public function refreshNavigationCounts(
+        RealtimeDashboardService $realtimeDashboard,
+        SecurityDashboardService $securityDashboard,
+        CashierAlertCountService $cashierAlerts,
+    ): void {
+        $this->loadCounts(
+            $realtimeDashboard,
+            $securityDashboard,
+            $cashierAlerts,
+        );
+    }
+
+    private function loadCounts(
+        RealtimeDashboardService $realtimeDashboard,
+        SecurityDashboardService $securityDashboard,
+        CashierAlertCountService $cashierAlerts,
+    ): void {
+        $this->counts = match ($this->roleName) {
+            'Admin' => $realtimeDashboard->admin() + [
+                'pending_refunds' => RefundRequest::query()
+                    ->where(fn ($query) => $query
+                        ->where('status', 'Pending')
+                        ->orWhere(fn ($gcash) => $gcash
+                            ->where('status', 'Approved')
+                            ->whereNull('refunded_at')
+                            ->whereNotNull('gcash_handoff_at')))
+                    ->count(),
+            ],
+            'Cashier' => $realtimeDashboard->cashier() + $cashierAlerts->counts(),
+            'Maintenance Staff' => $realtimeDashboard->maintenance(),
+            'Security Guard' => $securityDashboard->overview((int) auth()->id()),
+            default => [],
+        };
+    }
+
+    public function badge(string $key): ?int
+    {
+        $count = (int) ($this->counts[$key] ?? 0);
+
+        return $count > 0 ? $count : null;
+    }
+
+    public function cashierWorkCount(): ?int
+    {
+        $count = (int) ($this->counts['pending_gcash'] ?? 0)
+            + (int) ($this->counts['pending_checkouts'] ?? 0)
+            + (int) ($this->counts['unpaid_bookings'] ?? 0);
+
+        return $count > 0 ? $count : null;
+    }
+
+    public function maintenanceWorkCount(): ?int
+    {
+        $count = (int) ($this->counts['inspection_requests'] ?? 0)
+            + (int) ($this->counts['amenity_requests'] ?? 0);
+
+        return $count > 0 ? $count : null;
+    }
+};
+
+?>
+
+<div wire:poll.30s.visible="refreshNavigationCounts" class="contents">
+    <flux:sidebar.nav>
+        @if ($roleName === 'Admin')
+            <flux:sidebar.item icon="home" :href="route('admin.dashboard')" :current="request()->routeIs('admin.dashboard')" wire:navigate>Dashboard</flux:sidebar.item>
+            <flux:sidebar.item icon="users" :href="route('admin.users.index')" :current="request()->routeIs('admin.users.*')" wire:navigate>User</flux:sidebar.item>
+            <flux:sidebar.item icon="building-office" :href="route('admin.facilities.index')" :current="request()->routeIs('admin.facilities.*')" wire:navigate>Facility</flux:sidebar.item>
+            <flux:sidebar.item icon="sparkles" :href="route('admin.amenities.index')" :current="request()->routeIs('admin.amenities.*')" wire:navigate>Amenity</flux:sidebar.item>
+            <flux:sidebar.item icon="ticket" :href="route('admin.entrance-fees.index')" :current="request()->routeIs('admin.entrance-fees.*')" wire:navigate>Entrance Fee</flux:sidebar.item>
+            <flux:sidebar.item icon="receipt-percent" :href="route('admin.discounts.index')" :current="request()->routeIs('admin.discounts.*')" wire:navigate>Discount</flux:sidebar.item>
+            <flux:sidebar.item icon="exclamation-triangle" :href="route('admin.fines.index')" :current="request()->routeIs('admin.fines.*')" wire:navigate>Fine</flux:sidebar.item>
+            <flux:sidebar.item icon="arrow-uturn-left" :href="route('admin.refund-requests.index')" :current="request()->routeIs('admin.refund-requests.*')" :badge="$this->badge('pending_refunds')" wire:navigate>Refund Request</flux:sidebar.item>
+
+            <flux:sidebar.group expandable icon="chart-bar" heading="Reports" :expanded="request()->routeIs('admin.reports.*', 'admin.activity-logs.*')" class="grid">
+                <flux:sidebar.item :href="route('admin.reports.index')" :current="request()->routeIs('admin.reports.*')" wire:navigate>Management Reports</flux:sidebar.item>
+                <flux:sidebar.item :href="route('admin.activity-logs.index')" :current="request()->routeIs('admin.activity-logs.*')" wire:navigate>Activity Logs</flux:sidebar.item>
+            </flux:sidebar.group>
+        @elseif ($roleName === 'Cashier')
+            <flux:sidebar.item icon="home" :href="route('cashier.dashboard')" :current="request()->routeIs('cashier.dashboard')" wire:navigate>Dashboard</flux:sidebar.item>
+            <flux:sidebar.item icon="bell" :href="route('cashier.notifications.index')" :current="request()->routeIs('cashier.notifications.*')" :badge="$this->cashierWorkCount()" wire:navigate>Notifications</flux:sidebar.item>
+            <flux:sidebar.item icon="bolt" :href="route('cashier.action-center')" :current="request()->routeIs('cashier.action-center')" :badge="$this->cashierWorkCount()" wire:navigate>Action Center</flux:sidebar.item>
+            <flux:sidebar.item icon="ticket" :href="route('cashier.entrance-slips.index')" :current="request()->routeIs('cashier.entrance-slips.*')" wire:navigate>Entrance Slip</flux:sidebar.item>
+
+            <flux:sidebar.group expandable icon="calendar-days" heading="Reservation" :expanded="request()->routeIs('cashier.reservations.*', 'cashier.reservation-conversions.*')" class="grid">
+                <flux:sidebar.item :href="route('cashier.reservations.index')" :current="request()->routeIs('cashier.reservations.*')" :badge="$this->badge('reservations_today')" wire:navigate>Reservation Management</flux:sidebar.item>
+                <flux:sidebar.item :href="route('cashier.reservation-conversions.index')" :current="request()->routeIs('cashier.reservation-conversions.*')" wire:navigate>Reservation Conversion</flux:sidebar.item>
+            </flux:sidebar.group>
+
+            <flux:sidebar.group expandable icon="clipboard-document-list" heading="Booking" :expanded="request()->routeIs('cashier.bookings.*', 'cashier.check-ins.*', 'cashier.amenity-requests.*', 'cashier.check-outs.*')" class="grid">
+                <flux:sidebar.item :href="route('cashier.bookings.index')" :current="request()->routeIs('cashier.bookings.*')" :badge="$this->badge('bookings_arriving')" wire:navigate>Booking Management</flux:sidebar.item>
+                <flux:sidebar.item :href="route('cashier.check-ins.index')" :current="request()->routeIs('cashier.check-ins.*')" wire:navigate>Check-in</flux:sidebar.item>
+                <flux:sidebar.item :href="route('cashier.amenity-requests.index')" :current="request()->routeIs('cashier.amenity-requests.*')" wire:navigate>Amenity Requests</flux:sidebar.item>
+                <flux:sidebar.item :href="route('cashier.check-outs.index')" :current="request()->routeIs('cashier.check-outs.*')" :badge="$this->badge('checkouts_due')" wire:navigate>Check-out</flux:sidebar.item>
+            </flux:sidebar.group>
+
+            <flux:sidebar.group expandable icon="banknotes" heading="Payment" :expanded="request()->routeIs('cashier.payments.*', 'cashier.gcash-verifications.*')" class="grid">
+                <flux:sidebar.item :href="route('cashier.payments.index')" :current="request()->routeIs('cashier.payments.*')" wire:navigate>Payment Management</flux:sidebar.item>
+                <flux:sidebar.item :href="route('cashier.gcash-verifications.index')" :current="request()->routeIs('cashier.gcash-verifications.*')" :badge="$this->badge('pending_gcash')" wire:navigate>GCash Verification</flux:sidebar.item>
+            </flux:sidebar.group>
+
+            <flux:sidebar.item icon="document-text" :href="route('cashier.billings.index')" :current="request()->routeIs('cashier.billings.*')" wire:navigate>Billing Statement</flux:sidebar.item>
+
+            <flux:sidebar.item icon="chart-bar" :href="route('cashier.reports.index')" :current="request()->routeIs('cashier.reports.*')" wire:navigate>Reports</flux:sidebar.item>
+                
+            
+        @elseif ($roleName === 'Maintenance Staff')
+            <flux:sidebar.item icon="bell" :href="route('maintenance.notifications.index')" :current="request()->routeIs('maintenance.notifications.*')" :badge="$this->maintenanceWorkCount()" wire:navigate>Notifications</flux:sidebar.item>
+            <flux:sidebar.item icon="bolt" :href="route('maintenance.action-center')" :current="request()->routeIs('maintenance.action-center')" :badge="$this->maintenanceWorkCount()" wire:navigate>Action Center</flux:sidebar.item>
+            <flux:sidebar.item icon="sparkles" :href="route('maintenance.amenity-requests.index')" :current="request()->routeIs('maintenance.amenity-requests.*')" :badge="$this->badge('amenity_requests')" wire:navigate>Amenity Requests</flux:sidebar.item>
+            <flux:sidebar.group expandable icon="clipboard-document-check" heading="Facility Inspection" :expanded="request()->routeIs('maintenance.facility-inspections.*', 'maintenance.facility-photos.*')" class="grid">
+                <flux:sidebar.item :href="route('maintenance.facility-inspections.index')" :current="request()->routeIs('maintenance.facility-inspections.*')" :badge="$this->badge('inspection_requests')" wire:navigate>Facility Checklist</flux:sidebar.item>
+                <flux:sidebar.item :href="route('maintenance.facility-photos.index')" :current="request()->routeIs('maintenance.facility-photos.*')" wire:navigate>Facility Readiness</flux:sidebar.item>
+            </flux:sidebar.group>
+            
+        @elseif ($roleName === 'Security Guard')
+            <flux:sidebar.item icon="ticket" :href="route('security.entrance-slips.create')" :current="request()->routeIs('security.entrance-slips.*')" :badge="$this->badge('my_unpaid_slips_today')" wire:navigate>Entrance Slip</flux:sidebar.item>
+        @else
+            <flux:sidebar.item icon="home" :href="route('dashboard')" :current="request()->routeIs('dashboard')" wire:navigate>Dashboard</flux:sidebar.item>
+        @endif
+    </flux:sidebar.nav>
+</div>

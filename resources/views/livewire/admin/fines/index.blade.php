@@ -1,0 +1,1020 @@
+<?php
+
+use App\Models\Amenity;
+use App\Models\DamageType;
+use App\Models\Fine;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Pagination\LengthAwarePaginator;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\Rule;
+use Illuminate\Validation\ValidationException;
+use Livewire\Attributes\Computed;
+use Livewire\Attributes\Layout;
+use Livewire\Attributes\Title;
+use Livewire\Attributes\Url;
+use Livewire\Volt\Component;
+use Livewire\WithPagination;
+
+new #[Layout('layouts.app')] #[Title('Fines Management - Olaer Spring Resort')] class extends Component
+{
+
+    public function updated(string $property): void
+    {
+        // Clear the red highlight of a field as soon as the user edits it.
+        $this->resetValidation($property);
+    }
+
+    /** Error text for a required field; an empty required field only turns red (no text). */
+    public function visibleError(string $field): ?string
+    {
+        $message = $this->getErrorBag()->first($field);
+
+        if ($message === '') {
+            return null;
+        }
+
+        $value = data_get($this, $field);
+
+        return $value === null || $value === '' || $value === [] ? null : $message;
+    }
+    use WithPagination;
+
+    #[Url(as: 'q', except: '')]
+    public string $search = '';
+
+    #[Url(as: 'type', except: '')]
+    public string $typeFilter = '';
+
+    #[Url(as: 'damage_type', except: '')]
+    public string $damageTypeFilter = '';
+
+    #[Url(as: 'sort', except: 'fine_name')]
+    public string $sortField = 'fine_name';
+
+    #[Url(as: 'direction', except: 'asc')]
+    public string $sortDirection = 'asc';
+
+    #[Url(as: 'per_page', except: 10)]
+    public int $perPage = 10;
+
+    public ?int $editingFineId = null;
+    public bool $showFineEditor = false;
+    public bool $showDamageTypes = false;
+    public string $fineType = 'Situational';
+    public string $amenityId = '';
+    public string $damageTypeId = '';
+    public string $situationalFine = '';
+    public string $situationalFineDescription = '';
+    public string $fineCharge = '';
+
+    public ?int $editingDamageTypeId = null;
+    public string $damageType = '';
+
+    #[Computed]
+    public function amenities(): Collection
+    {
+        return Amenity::query()
+            ->with('amenityName')
+            ->get()
+            ->sortBy(
+                fn (Amenity $amenity): string =>
+                    ($amenity->amenityName?->amenity_name ?? '')
+                    .' '
+                    .$amenity->amenity_description,
+                SORT_NATURAL | SORT_FLAG_CASE,
+            )
+            ->values();
+    }
+
+    #[Computed]
+    public function damageTypes(): Collection
+    {
+        return DamageType::query()
+            ->withCount('fines')
+            ->orderBy('damage_type')
+            ->get();
+    }
+
+    #[Computed]
+    public function fines(): LengthAwarePaginator
+    {
+        $allowedSorts = [
+            'fine_name',
+            'fine_type',
+            'damage_type',
+            'fine_charge',
+        ];
+
+        $sortField = in_array($this->sortField, $allowedSorts, true)
+            ? $this->sortField
+            : 'fine_name';
+
+        $direction = $this->sortDirection === 'desc' ? 'desc' : 'asc';
+
+        $perPage = in_array($this->perPage, [10, 25, 50, 100], true)
+            ? $this->perPage
+            : 10;
+
+        $query = Fine::query()
+            ->select('tbl_fine.*')
+            ->leftJoin(
+                'tbl_amenity',
+                'tbl_amenity.amenity_id',
+                '=',
+                'tbl_fine.amenity_id',
+            )
+            ->leftJoin(
+                'tbl_amenity_name',
+                'tbl_amenity_name.amenity_name_id',
+                '=',
+                'tbl_amenity.amenity_name_id',
+            )
+            ->leftJoin(
+                'tbl_damage_type',
+                'tbl_damage_type.damage_type_id',
+                '=',
+                'tbl_fine.damage_type_id',
+            )
+            ->with([
+                'amenity.amenityName',
+                'damageType',
+            ])
+            ->withCount('guestFines')
+            ->when(
+                $this->typeFilter !== '',
+                fn (Builder $query) => $query->where(
+                    'tbl_fine.fine_type',
+                    $this->typeFilter,
+                ),
+            )
+            ->when(
+                $this->damageTypeFilter !== '',
+                fn (Builder $query) => $query->where(
+                    'tbl_fine.damage_type_id',
+                    $this->damageTypeFilter,
+                ),
+            )
+            ->when(trim($this->search) !== '', function (Builder $query): void {
+                $like = '%'.trim($this->search).'%';
+
+                $query->where(function (Builder $query) use ($like): void {
+                    $query->where('tbl_fine.fine_type', 'like', $like)
+                        ->orWhere('tbl_fine.situational_fine', 'like', $like)
+                        ->orWhere(
+                            'tbl_fine.situational_fine_description',
+                            'like',
+                            $like,
+                        )
+                        ->orWhere('tbl_fine.fine_charge', 'like', $like)
+                        ->orWhere(
+                            'tbl_amenity_name.amenity_name',
+                            'like',
+                            $like,
+                        )
+                        ->orWhere(
+                            'tbl_amenity.amenity_description',
+                            'like',
+                            $like,
+                        )
+                        ->orWhere(
+                            'tbl_damage_type.damage_type',
+                            'like',
+                            $like,
+                        );
+                });
+            });
+
+        match ($sortField) {
+            'fine_type' => $query
+                ->orderBy('tbl_fine.fine_type', $direction)
+                ->orderBy('tbl_fine.fine_id'),
+            'damage_type' => $query
+                ->orderBy('tbl_damage_type.damage_type', $direction)
+                ->orderBy('tbl_fine.fine_id'),
+            'fine_charge' => $query
+                ->orderBy('tbl_fine.fine_charge', $direction)
+                ->orderBy('tbl_fine.fine_id'),
+            default => $query
+                ->orderByRaw(
+                    "CASE
+                        WHEN tbl_fine.fine_type = 'Amenity'
+                            THEN CONCAT(
+                                COALESCE(tbl_amenity_name.amenity_name, ''),
+                                ' ',
+                                COALESCE(tbl_amenity.amenity_description, '')
+                            )
+                        ELSE COALESCE(tbl_fine.situational_fine, '')
+                    END {$direction}"
+                )
+                ->orderBy('tbl_fine.fine_id'),
+        };
+
+        return $query->paginate($perPage);
+    }
+
+    public function updatedSearch(): void
+    {
+        $this->resetPage();
+    }
+
+    public function updatedTypeFilter(): void
+    {
+        $this->resetPage();
+    }
+
+    public function updatedDamageTypeFilter(): void
+    {
+        $this->resetPage();
+    }
+
+    public function updatedPerPage(): void
+    {
+        if (! in_array($this->perPage, [10, 25, 50, 100], true)) {
+            $this->perPage = 10;
+        }
+
+        $this->resetPage();
+    }
+
+    public function updatedFineType(string $fineType): void
+    {
+        if ($fineType === 'Amenity') {
+            $this->situationalFine = '';
+            $this->situationalFineDescription = '';
+        } else {
+            $this->amenityId = '';
+            $this->damageTypeId = '';
+        }
+
+        $this->resetValidation();
+    }
+
+    public function clearFilters(): void
+    {
+        $this->search = '';
+        $this->typeFilter = '';
+        $this->damageTypeFilter = '';
+        $this->sortField = 'fine_name';
+        $this->sortDirection = 'asc';
+        $this->perPage = 10;
+
+        $this->resetPage();
+    }
+
+    public function sortBy(string $field): void
+    {
+        $allowedSorts = [
+            'fine_name',
+            'fine_type',
+            'damage_type',
+            'fine_charge',
+        ];
+
+        if (! in_array($field, $allowedSorts, true)) {
+            return;
+        }
+
+        if ($this->sortField === $field) {
+            $this->sortDirection = $this->sortDirection === 'asc'
+                ? 'desc'
+                : 'asc';
+        } else {
+            $this->sortField = $field;
+            $this->sortDirection = 'asc';
+        }
+
+        $this->resetPage();
+    }
+
+    public function createNewFine(): void
+    {
+        $this->resetFineForm();
+        $this->showFineEditor = true;
+    }
+
+    public function startEditingFine(int $fineId): void
+    {
+        $fine = Fine::query()
+            ->with([
+                'amenity',
+                'damageType',
+            ])
+            ->findOrFail($fineId);
+
+        $this->editingFineId = (int) $fine->fine_id;
+        $this->fineType = (string) $fine->fine_type;
+        $this->amenityId = $fine->amenity_id
+            ? (string) $fine->amenity_id
+            : '';
+        $this->damageTypeId = $fine->damage_type_id
+            ? (string) $fine->damage_type_id
+            : '';
+        $this->situationalFine = (string) (
+            $fine->situational_fine ?? ''
+        );
+        $this->situationalFineDescription = (string) (
+            $fine->situational_fine_description ?? ''
+        );
+        $this->fineCharge = number_format(
+            (float) $fine->fine_charge,
+            2,
+            '.',
+            '',
+        );
+
+        $this->resetValidation();
+        $this->showFineEditor = true;
+    }
+
+    public function cancelFineEdit(): void
+    {
+        session()->flash('success', 'Fine edit cancelled. No changes were saved.');
+        $this->showFineEditor = false;
+        $this->resetFineForm();
+    }
+
+    public function manageDamageTypes(): void
+    {
+        $this->resetDamageTypeForm();
+        $this->showDamageTypes = true;
+    }
+
+    public function resetFineForm(): void
+    {
+        $this->editingFineId = null;
+        $this->fineType = 'Situational';
+        $this->amenityId = '';
+        $this->damageTypeId = '';
+        $this->situationalFine = '';
+        $this->situationalFineDescription = '';
+        $this->fineCharge = '';
+
+        $this->resetValidation();
+    }
+
+    public function saveFine(): void
+    {
+        $validated = $this->validate([
+            'editingFineId' => [
+                'nullable',
+                'integer',
+                'exists:tbl_fine,fine_id',
+            ],
+            'fineType' => [
+                'required',
+                Rule::in(['Amenity', 'Situational']),
+            ],
+            'amenityId' => [
+                'nullable',
+                'integer',
+                'exists:tbl_amenity,amenity_id',
+            ],
+            'damageTypeId' => [
+                'nullable',
+                'integer',
+                'exists:tbl_damage_type,damage_type_id',
+            ],
+            'situationalFine' => ['nullable', 'string', 'max:50'],
+            'situationalFineDescription' => [
+                'nullable',
+                'string',
+                'max:100',
+            ],
+            'fineCharge' => [
+                'required',
+                'numeric',
+                'min:0.01',
+                'max:999999.99',
+            ],
+        ], [
+            'fineType.in' => 'Fine type must be Amenity or Situational.',
+            'amenityId.exists' => 'Selected amenity does not exist.',
+            'damageTypeId.exists' => 'Selected damage type does not exist.',
+            'situationalFine.max' => 'Situational fine name must not exceed 50 characters.',
+            'situationalFineDescription.max' => 'Description must not exceed 100 characters.',
+            'fineCharge.required' => 'Fine charge is required.',
+            'fineCharge.numeric' => 'Fine charge must be a valid amount.',
+            'fineCharge.min' => 'Fine charge must be greater than zero.',
+        ]);
+
+        $type = $validated['fineType'];
+        $charge = round((float) $validated['fineCharge'], 2);
+
+        if ($type === 'Amenity') {
+            if (! filled($validated['amenityId'] ?? null)) {
+                $this->addError(
+                    'amenityId',
+                    'Amenity fines must be linked to an amenity.',
+                );
+
+                return;
+            }
+
+            if (! filled($validated['damageTypeId'] ?? null)) {
+                $this->addError(
+                    'damageTypeId',
+                    'Amenity fines must be linked to a damage type.',
+                );
+
+                return;
+            }
+
+            $duplicate = Fine::query()
+                ->where('fine_type', 'Amenity')
+                ->where('amenity_id', $validated['amenityId'])
+                ->where(
+                    'damage_type_id',
+                    $validated['damageTypeId'],
+                )
+                ->when(
+                    $this->editingFineId !== null,
+                    fn (Builder $query) => $query->where(
+                        'fine_id',
+                        '!=',
+                        $this->editingFineId,
+                    ),
+                )
+                ->exists();
+
+            if ($duplicate) {
+                $this->addError(
+                    'amenityId',
+                    'This amenity already has a fine for the selected damage type.',
+                );
+
+                return;
+            }
+
+            $payload = [
+                'fine_type' => 'Amenity',
+                'amenity_id' => (int) $validated['amenityId'],
+                'damage_type_id' => (int) $validated['damageTypeId'],
+                'situational_fine' => null,
+                'situational_fine_description' => null,
+                'fine_charge' => $charge,
+            ];
+        } else {
+            $name = trim(
+                preg_replace(
+                    '/\s+/',
+                    ' ',
+                    (string) $validated['situationalFine'],
+                )
+            );
+
+            $description = trim(
+                preg_replace(
+                    '/\s+/',
+                    ' ',
+                    (string) (
+                        $validated['situationalFineDescription'] ?? ''
+                    ),
+                )
+            );
+
+            if ($name === '') {
+                $this->addError(
+                    'situationalFine',
+                    'Situational fine name is required.',
+                );
+
+                return;
+            }
+
+            $duplicate = Fine::query()
+                ->where('fine_type', 'Situational')
+                ->whereRaw(
+                    'LOWER(situational_fine) = ?',
+                    [mb_strtolower($name)],
+                )
+                ->when(
+                    $this->editingFineId !== null,
+                    fn (Builder $query) => $query->where(
+                        'fine_id',
+                        '!=',
+                        $this->editingFineId,
+                    ),
+                )
+                ->exists();
+
+            if ($duplicate) {
+                $this->addError(
+                    'situationalFine',
+                    'This situational fine already exists.',
+                );
+
+                return;
+            }
+
+            $payload = [
+                'fine_type' => 'Situational',
+                'amenity_id' => null,
+                'damage_type_id' => null,
+                'situational_fine' => $name,
+                'situational_fine_description' =>
+                    $description !== '' ? $description : null,
+                'fine_charge' => $charge,
+            ];
+        }
+
+        DB::transaction(function () use ($payload): void {
+            if ($this->editingFineId !== null) {
+                Fine::query()
+                    ->findOrFail($this->editingFineId)
+                    ->update($payload);
+            } else {
+                Fine::query()
+                    ->create($payload);
+            }
+        });
+
+        session()->flash(
+            'success',
+            $this->editingFineId !== null
+                ? 'Fine updated successfully.'
+                : 'Fine created successfully.',
+        );
+
+        $this->resetFineForm();
+        $this->showFineEditor = false;
+        unset($this->fines);
+    }
+
+    public function startEditingDamageType(int $damageTypeId): void
+    {
+        $damageType = DamageType::query()->findOrFail($damageTypeId);
+
+        $this->editingDamageTypeId =
+            (int) $damageType->damage_type_id;
+        $this->damageType = (string) $damageType->damage_type;
+
+        $this->resetValidation();
+        $this->showDamageTypes = true;
+    }
+
+    public function closeDamageTypes(): void
+    {
+        if ($this->editingDamageTypeId !== null || $this->damageType !== '') {
+            session()->flash('success', 'Damage type edit cancelled. No changes were saved.');
+        }
+        $this->showDamageTypes = false;
+        $this->resetDamageTypeForm();
+    }
+
+    public function resetDamageTypeForm(): void
+    {
+        $this->editingDamageTypeId = null;
+        $this->damageType = '';
+
+        $this->resetValidation();
+    }
+
+    public function saveDamageType(): void
+    {
+        $validated = $this->validate([
+            'editingDamageTypeId' => [
+                'nullable',
+                'integer',
+                'exists:tbl_damage_type,damage_type_id',
+            ],
+            'damageType' => ['required', 'string', 'max:50'],
+        ], [
+            'damageType.required' => 'Damage type is required.',
+            'damageType.max' => 'Damage type must not exceed 50 characters.',
+        ]);
+
+        $name = trim(
+            preg_replace('/\s+/', ' ', $validated['damageType'])
+        );
+
+        $duplicate = DamageType::query()
+            ->whereRaw(
+                'LOWER(damage_type) = ?',
+                [mb_strtolower($name)],
+            )
+            ->when(
+                $this->editingDamageTypeId !== null,
+                fn (Builder $query) => $query->where(
+                    'damage_type_id',
+                    '!=',
+                    $this->editingDamageTypeId,
+                ),
+            )
+            ->exists();
+
+        if ($duplicate) {
+            $this->addError(
+                'damageType',
+                'This damage type already exists.',
+            );
+
+            return;
+        }
+
+        DB::transaction(function () use ($name): void {
+            if ($this->editingDamageTypeId !== null) {
+                DamageType::query()
+                    ->findOrFail($this->editingDamageTypeId)
+                    ->update([
+                        'damage_type' => $name,
+                    ]);
+            } else {
+                DamageType::query()->create([
+                    'damage_type' => $name,
+                ]);
+            }
+        });
+
+        session()->flash(
+            'success',
+            $this->editingDamageTypeId !== null
+                ? 'Damage type updated successfully.'
+                : 'Damage type created successfully.',
+        );
+
+        $this->resetDamageTypeForm();
+
+        unset(
+            $this->damageTypes,
+            $this->fines,
+        );
+    }
+
+    public function sortIcon(string $field): string
+    {
+        if ($this->sortField !== $field) {
+            return '↕';
+        }
+
+        return $this->sortDirection === 'asc' ? '↑' : '↓';
+    }
+
+    public function fineName(Fine $fine): string
+    {
+        if ($fine->fine_type === 'Amenity') {
+            $amenityName =
+                $fine->amenity?->amenityName?->amenity_name
+                ?? 'Unknown amenity';
+
+            $description = $fine->amenity?->amenity_description;
+
+            return filled($description)
+                ? $amenityName.' — '.$description
+                : $amenityName;
+        }
+
+        return $fine->situational_fine
+            ?? 'Unnamed situational fine';
+    }
+
+    public function fineDescription(Fine $fine): string
+    {
+        if ($fine->fine_type === 'Amenity') {
+            return 'Amenity-related charge applied during inspection or check-out.';
+        }
+
+        return $fine->situational_fine_description
+            ?: 'No description provided.';
+    }
+
+    public function typeColor(string $type): string
+    {
+        return match ($type) {
+            'Amenity' => 'blue',
+            'Situational' => 'purple',
+            default => 'zinc',
+        };
+    }
+};
+
+?>
+
+<div class="space-y-6">
+    <div class="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+        <div>
+            <h1 class="text-2xl font-bold tracking-tight">
+                Fines Management
+            </h1>
+
+            <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
+                Manage fine categories and charge amounts.
+            </p>
+        </div>
+
+        <div class="mt-3 flex flex-wrap gap-2">
+            <flux:button type="button" wire:click="manageDamageTypes" variant="ghost">Manage damage types</flux:button>
+            <flux:button type="button" wire:click="createNewFine" variant="primary">Create Fine</flux:button>
+                        
+        @if (Route::has('admin.dashboard'))
+            <flux:button
+                href="{{ route('admin.dashboard') }}"
+                wire:navigate
+                variant="ghost"
+            >
+                Back to Dashboard
+            </flux:button>
+        @endif
+        </div>
+    </div>
+
+    <x-toast :message="session('success')" fresh />
+
+
+    <div>
+        <section class="min-w-0">
+            <flux:card class="overflow-hidden p-0">
+                
+
+                    <div class="grid gap-3 border-b border-zinc-200 p-5 md:grid-cols-4 dark:border-zinc-800">
+                        <flux:input
+                            wire:model.live.debounce.300ms="search"
+                            label="Search"
+                            placeholder="Fine, amenity, damage type, description"
+                            clearable
+                            class="xl:col-span-2"
+                        />
+
+                        <flux:select
+                            wire:model.live="typeFilter"
+                            label="Fine type"
+                        >
+                            <option value="">All types</option>
+                            <option value="Amenity">Amenity</option>
+                            <option value="Situational">Situational</option>
+                        </flux:select>
+
+                        <flux:select
+                            wire:model.live="damageTypeFilter"
+                            label="Damage type"
+                        >
+                            <option value="">All damage types</option>
+
+                            @foreach ($this->damageTypes as $damageTypeOption)
+                                <option value="{{ $damageTypeOption->damage_type_id }}">
+                                    {{ $damageTypeOption->damage_type }}
+                                </option>
+                            @endforeach
+                        </flux:select>
+
+                        <div class="flex items-end gap-2">
+                        <flux:select wire:model.live="perPage" label="Rows">
+                            <option value="10">10</option>
+                            <option value="25">25</option>
+                            <option value="50">50</option>
+                            <option value="100">100</option>
+                        </flux:select>
+                        <flux:button
+                            type="button"
+                            wire:click="clearFilters"
+                            variant="ghost"
+                        >
+                            Clear Filters
+                        </flux:button>
+                        </div>
+                    </div>
+
+
+                        
+
+                
+
+                <div class="overflow-x-auto">
+                    <table class="w-full min-w-[68rem] text-left text-sm">
+                        <thead class="border-b border-zinc-200 bg-zinc-50 text-xs uppercase tracking-wide text-zinc-500 dark:border-zinc-800 dark:bg-zinc-900/50">
+                            <tr>
+                                <th class="px-5 py-3 text-left"><button type="button" wire:click="sortBy('fine_name')">FINE{{ $this->sortIcon('fine_name') }}</button></th>
+                                <th class="px-5 py-3 text-left"><button type="button" wire:click="sortBy('fine_type')">FINE TYPE{{ $this->sortIcon('fine_type') }}</button></th>
+                                <th class="px-5 py-3 text-left"><button type="button" wire:click="sortBy('damage_type')">DAMAGE TYPE{{ $this->sortIcon('damage_type') }}</button></th>
+                                <th class="px-5 py-3 text-left"><button type="button" wire:click="sortBy('fine_charge')">FINE CHARGE{{ $this->sortIcon('fine_charge') }}</button></th>
+                                <th class="px-5 py-3 text-right">Action</th>
+                            </tr>
+                        </thead>
+
+                        <tbody class="divide-y divide-zinc-100 dark:divide-zinc-800">
+                            @forelse ($this->fines as $fine)
+                                <tr wire:key="fine-row-{{ $fine->fine_id }}" class="{{ $editingFineId === (int) $fine->fine_id ? 'bg-blue-50 ring-1 ring-inset ring-blue-200 dark:bg-blue-950/30 dark:ring-blue-800' : ''}}hover:bg-brand-surface-muted/70 dark:hover:bg-zinc-800/50">
+                                    <td class="max-w-sm px-5 py-4">
+                                        <p class="font-medium">
+                                            {{ $this->fineName($fine) }}
+                                        </p>
+
+                                        <p class="mt-1 text-xs leading-5 text-zinc-500">
+                                            {{ $this->fineDescription($fine) }}
+                                        </p>
+                                    </td>
+
+                                    <td class="px-5 py-4">
+                                        <flux:badge
+                                            color="{{ $this->typeColor((string) $fine->fine_type) }}"
+                                            size="sm"
+                                        >
+                                            {{ $fine->fine_type }}
+                                        </flux:badge>
+                                    </td>
+
+                                    <td class="px-5 py-4">
+                                        {{ $fine->damageType?->damage_type ?? 'N/A' }}
+                                    </td>
+
+                                    <td class="px-5 py-4 font-semibold">
+                                        ₱{{ number_format((float) $fine->fine_charge, 2) }}
+                                    </td>
+
+                                    <td class="px-5 py-4 text-right">
+                                        <flux:button
+                                            type="button"
+                                            wire:click="startEditingFine({{ $fine->fine_id }})"
+                                            icon="pencil-square"
+                                            size="sm"
+                                            variant="ghost"
+                                        >
+                                            Edit
+                                        </flux:button>
+                                    </td>
+                                </tr>
+                            @empty
+                                <tr>
+                                    <td colspan="6" class="px-5 py-12 text-center text-zinc-500">
+                                        No fine matches the selected filters.
+                                    </td>
+                                </tr>
+                            @endforelse
+                        </tbody>
+                    </table>
+                </div>
+
+                <div class="flex flex-col gap-3 border-t border-zinc-200 px-5 py-4 sm:flex-row sm:items-center sm:justify-between dark:border-zinc-800">
+                    <p class="text-sm text-zinc-500">
+                        Showing
+                        {{ $this->fines->firstItem() ?? 0 }}
+                        to
+                        {{ $this->fines->lastItem() ?? 0 }}
+                        of
+                        {{ $this->fines->total() }}
+                        fines
+                    </p>
+
+                    {{ $this->fines->links() }}
+                </div>
+            </flux:card>
+        </section>
+
+        <flux:modal wire:model="showFineEditor" class="md:w-[38rem] max-h-[90vh] overflow-y-auto">
+                <div class="flex items-start justify-between gap-4">
+                    <div>
+                        <h2 class="font-semibold">
+                            {{ $editingFineId !== null
+                                ? 'Edit fine'
+                                : 'Create fine' }}
+                        </h2>
+
+                        <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
+                            Amenity fines are item-based; situational fines are event-based.
+                        </p>
+                    </div>
+
+                </div>
+
+                <form wire:submit="saveFine" novalidate class="mt-5 space-y-4">
+                    <flux:field class="relative">
+                        <flux:label>Fine type <span class="text-red-500">*</span></flux:label>
+                        <flux:select wire:model.live="fineType" :invalid="$errors->has('fineType')">
+                        <option value="Situational">Situational</option>
+                        <option value="Amenity">Amenity</option>
+                    </flux:select>
+                        @if ($msg = $this->visibleError('fineType'))
+                            <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $msg }}</p>
+                        @endif
+                    </flux:field>
+
+                    @if ($fineType === 'Amenity')
+                        <flux:select
+                            wire:model="amenityId"
+                            label="Amenity"
+                        >
+                            <option value="">Select amenity</option>
+
+                            @foreach ($this->amenities as $amenity)
+                                <option value="{{ $amenity->amenity_id }}">
+                                    {{ $amenity->amenityName?->amenity_name ?? 'Unnamed amenity' }}
+                                    — {{ $amenity->amenity_description }}
+                                </option>
+                            @endforeach
+                        </flux:select>
+
+                        <flux:select
+                            wire:model="damageTypeId"
+                            label="Damage type"
+                        >
+                            <option value="">Select damage type</option>
+
+                            @foreach ($this->damageTypes as $damageTypeOption)
+                                <option value="{{ $damageTypeOption->damage_type_id }}">
+                                    {{ $damageTypeOption->damage_type }}
+                                </option>
+                            @endforeach
+                        </flux:select>
+                    @else
+                        <flux:input
+                            wire:model="situationalFine"
+                            label="Situational fine"
+                            placeholder="Example: Stained Fabric"
+                        />
+
+                        <flux:input
+                            wire:model="situationalFineDescription"
+                            label="Description"
+                            placeholder="Describe when this charge applies"
+                        />
+                    @endif
+
+                    <flux:field class="relative">
+                        <flux:label>Fine charge <span class="text-red-500">*</span></flux:label>
+                        <flux:input wire:model="fineCharge" type="number" step="0.01" min="0.01" placeholder="Example: 200.00" :invalid="$errors->has('fineCharge')" />
+                        @if ($msg = $this->visibleError('fineCharge'))
+                            <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $msg }}</p>
+                        @endif
+                    </flux:field>
+
+
+
+                    <div class="flex justify-end gap-3 pt-2">
+                        <flux:button
+                            type="button"
+                            wire:click="cancelFineEdit"
+                            variant="ghost"
+                        >
+                            Cancel
+                        </flux:button>
+
+                        <flux:button type="submit" variant="primary">
+                            {{ $editingFineId !== null
+                                ? 'Save Changes'
+                                : 'Save Fine' }}
+                        </flux:button>
+                    </div>
+                </form>
+        </flux:modal>
+
+        <flux:modal wire:model="showDamageTypes" class="md:w-[36rem] max-h-[90vh] overflow-y-auto">
+                <div class="flex items-start justify-between gap-4">
+                    <div>
+                        <h2 class="font-semibold">Damage types</h2>
+
+                        <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
+                            Shared classifications used by amenity fines.
+                        </p>
+                    </div>
+
+                </div>
+
+                <form wire:submit="saveDamageType" novalidate class="mt-5 space-y-4">
+                    <flux:field class="relative">
+                        <flux:label>Damage type <span class="text-red-500">*</span></flux:label>
+                        <flux:input wire:model="damageType" placeholder="Damaged, Missing, Stained" :invalid="$errors->has('damageType')" />
+                        @if ($msg = $this->visibleError('damageType'))
+                            <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $msg }}</p>
+                        @endif
+                    </flux:field>
+
+                    <div class="flex justify-end gap-3">
+                        <flux:button
+                            type="button"
+                            wire:click="closeDamageTypes"
+                            variant="ghost"
+                        >
+                            Close
+                        </flux:button>
+
+                        <flux:button type="submit" variant="primary">
+                            {{ $editingDamageTypeId !== null
+                                ? 'Save Changes'
+                                : 'Add Damage Type' }}
+                        </flux:button>
+                    </div>
+                </form>
+
+                <div class="mt-5 max-h-72 space-y-2 overflow-y-auto">
+                    @forelse ($this->damageTypes as $damageTypeOption)
+                        <button
+                            type="button"
+                            wire:click="startEditingDamageType({{ $damageTypeOption->damage_type_id }})"
+                            class="flex w-full items-center justify-between rounded-lg border border-zinc-200 px-3 py-2 text-left text-sm transition hover:bg-zinc-50 dark:border-zinc-800 dark:hover:bg-zinc-900"
+                        >
+                            <span>{{ $damageTypeOption->damage_type }}</span>
+
+                            <span class="text-xs text-zinc-500">
+                                {{ $damageTypeOption->fines_count }}
+                                fine{{ (int) $damageTypeOption->fines_count === 1 ? '' : 's' }}
+                            </span>
+                        </button>
+                    @empty
+                        <p class="text-sm text-zinc-500">
+                            No damage type has been configured.
+                        </p>
+                    @endforelse
+                </div>
+        </flux:modal>
+    </div>
+</div>

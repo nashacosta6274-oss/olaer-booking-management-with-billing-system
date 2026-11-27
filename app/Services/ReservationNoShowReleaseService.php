@@ -1,0 +1,178 @@
+<?php
+
+namespace App\Services;
+
+use App\Models\GuestVerificationOtp;
+use App\Models\Payment;
+use App\Models\Reservation;
+use App\Models\ReservationDetail;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\DB;
+use InvalidArgumentException;
+
+class ReservationNoShowReleaseService
+{
+    private const OTP_PURPOSE = 'reservation_manage';
+
+    public function __construct(
+        private readonly FacilityScheduleLockService $scheduleLock,
+        private readonly FacilityScheduleBlockService $scheduleBlocks,
+    ) {}
+
+    public function expirePastUnpaidReservations(
+        ?string $asOfDate = null,
+        int $limit = 100,
+    ): int {
+        $date = $this->normalizeDate($asOfDate);
+
+        if ($limit < 1) {
+            throw new InvalidArgumentException(
+                'Limit must be at least 1.',
+            );
+        }
+
+        return DB::transaction(function () use (
+            $date,
+            $limit,
+        ): int {
+            $reservations = Reservation::query()
+                ->where('status', 'Active')
+                ->whereDoesntHave(
+                    'payments',
+                    function ($query): void {
+                        $query->whereRaw(
+                            'LOWER(payment_status) = ?',
+                            ['verified'],
+                        );
+                    },
+                )
+                ->whereHas(
+                    'details',
+                    function ($query) use ($date): void {
+                        $query->where(
+                            'check_in_date',
+                            '<',
+                            $date,
+                        );
+                    },
+                )
+                ->orderBy('reservation_id')
+                ->limit($limit)
+                ->lockForUpdate()
+                ->get();
+
+            $details = ReservationDetail::query()
+                ->whereIn('reservation_id', $reservations->pluck('reservation_id'))
+                ->orderBy('reservation_details_id')
+                ->lockForUpdate()
+                ->get();
+
+            if ($details->isNotEmpty()) {
+                $this->scheduleLock->lockMany(
+                    $details->pluck('facility_id')->all(),
+                );
+            }
+
+            foreach ($reservations as $reservation) {
+                $reservation->update([
+                    'status' => 'No-show',
+                ]);
+
+                $this->expireManagementOtps(
+                    (int) $reservation->reservation_id,
+                );
+
+                $this->cancelPendingGcashPayments(
+                    (int) $reservation->reservation_id,
+                );
+            }
+
+            $this->scheduleBlocks->releaseReservationDetails($details);
+
+            return $reservations->count();
+        });
+    }
+
+    public function eligibleCount(
+        ?string $asOfDate = null,
+    ): int {
+        $date = $this->normalizeDate($asOfDate);
+
+        return Reservation::query()
+            ->where('status', 'Active')
+            ->whereDoesntHave(
+                'payments',
+                function ($query): void {
+                    $query->whereRaw(
+                        'LOWER(payment_status) = ?',
+                        ['verified'],
+                    );
+                },
+            )
+            ->whereHas(
+                'details',
+                function ($query) use ($date): void {
+                    $query->where(
+                        'check_in_date',
+                        '<',
+                        $date,
+                    );
+                },
+            )
+            ->count();
+    }
+
+    /**
+     * A no-show reservation will never be paid, so any GCash proof still waiting
+     * for verification is cancelled and leaves the cashier's verification queue
+     * (same wording as when a reservation is cancelled). Verified payments are
+     * never touched here, and rejected ones stay rejected.
+     */
+    private function cancelPendingGcashPayments(
+        int $reservationId,
+    ): void {
+        Payment::query()
+            ->where('reservation_id', $reservationId)
+            ->whereRaw('LOWER(payment_status) = ?', ['pending'])
+            ->whereHas('modeOfPayment', function ($query): void {
+                $query->whereRaw('LOWER(mode_of_payment) = ?', ['gcash']);
+            })
+            ->get()
+            ->each(fn (Payment $payment) => $payment->update([
+                'payment_status' => 'Cancelled',
+            ]));
+    }
+
+    private function expireManagementOtps(
+        int $reservationId,
+    ): void {
+        GuestVerificationOtp::query()
+            ->where('reservation_id', $reservationId)
+            ->where('purpose', self::OTP_PURPOSE)
+            ->whereNull('verified_at')
+            ->update([
+                'expires_at' => Carbon::now()->subMinute(),
+            ]);
+    }
+
+    private function normalizeDate(
+        ?string $asOfDate,
+    ): string {
+        if (
+            $asOfDate === null
+            || trim($asOfDate) === ''
+        ) {
+            return Carbon::today()->toDateString();
+        }
+
+        try {
+            return Carbon::parse(
+                $asOfDate,
+            )->toDateString();
+        } catch (\Throwable) {
+            throw new InvalidArgumentException(
+                'Use a valid date for reservation no-show release.',
+            );
+        }
+    }
+}

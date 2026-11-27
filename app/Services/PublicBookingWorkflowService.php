@@ -1,0 +1,234 @@
+<?php
+
+namespace App\Services;
+
+use App\Models\Address;
+use App\Models\Booking;
+use App\Models\BookingDetail;
+use App\Models\Guest;
+use App\Models\ModeOfPayment;
+use App\Models\Payment;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
+use InvalidArgumentException;
+
+class PublicBookingWorkflowService
+{
+    public function __construct(
+        private readonly BookingQuoteService $quoteService,
+        private readonly FacilityOccupancyService $occupancy,
+        private readonly FacilityScheduleLockService $scheduleLock,
+        private readonly FacilityScheduleBlockService $scheduleBlocks,
+        private readonly GcashReferenceIntegrityService $gcashReferences,
+        private readonly GuestConfirmationEmailService $confirmationEmailService,
+        private readonly DetailExtraGuestService $detailGuests,
+        private readonly DecimalMoneyService $money,
+    ) {}
+
+    /** @param array<string, mixed> $data */
+    public function createGuestBookingWithPendingGcash(array $data): Booking
+    {
+        $booking = DB::transaction(function () use ($data): Booking {
+            $facilityId = (int) $data['facility_id'];
+            $rateType = (string) $data['rate_type'];
+            $checkInDate = (string) $data['check_in_date'];
+            $checkOutDate = (string) $data['check_out_date'];
+
+            $facility = $this->scheduleLock->lockOne($facilityId);
+
+            if ($facility->facility_status !== 'Available') {
+                throw new InvalidArgumentException('The selected facility is not available.');
+            }
+
+            $totalGuestCount = (int) ($data['total_guest_count'] ?? 0);
+            $extraGuests = $this->cleanExtraGuests(
+                $data['extra_guests'] ?? [],
+            );
+            $occupancy = $this->occupancy->forFacilityId(
+                $facilityId,
+                $totalGuestCount,
+            );
+            $this->occupancy->assertNamedPaidExtraGuests(
+                $extraGuests,
+                $occupancy['paid_extra_guest_count'],
+            );
+            $extraGuestCount =
+                $occupancy['paid_extra_guest_count'];
+
+            $quote = $this->quoteService->quote(
+                facilityId: $facilityId,
+                rateType: $rateType,
+                discountId: null,
+                totalGuestCount: $totalGuestCount,
+            );
+
+            $paymentAmount = $this->money->normalize(
+                $data['payment_amount'],
+            );
+            $total = $this->money->normalize($quote['total']);
+
+            if (! $this->money->equals($paymentAmount, $total)) {
+                throw new InvalidArgumentException('Online booking requires exact full GCash payment before submission. Staff will still verify the proof.');
+            }
+
+            $mode = ModeOfPayment::query()
+                ->whereRaw('LOWER(mode_of_payment) = ?', ['gcash'])
+                ->first();
+
+            if (! $mode) {
+                throw new InvalidArgumentException('GCash payment mode is not configured. Seed or add GCash in Mode of Payment first.');
+            }
+
+            $referenceNumber = trim((string) ($data['reference_number'] ?? ''));
+
+            $referenceNumber = $this->gcashReferences
+                ->assertAvailable($referenceNumber);
+
+            $proofPath = trim((string) ($data['proof_of_payment_path'] ?? ''));
+
+            if ($proofPath === '') {
+                throw new InvalidArgumentException('Proof of payment is required.');
+            }
+
+            $address = Address::query()->create([
+                'purok' => $data['purok'] ?? null,
+                'province' => $data['province'],
+                'city' => $data['city'],
+                'barangay' => $data['barangay'] ?? null,
+            ]);
+
+            $guest = Guest::query()->create([
+                'first_name' => $data['first_name'],
+                'middle_name' => $data['middle_name'] ?? null,
+                'last_name' => $data['last_name'],
+                'contact_no' => $data['contact_no'],
+                'email' => $data['email'],
+                'address_id' => $address->address_id,
+            ]);
+
+            $booking = Booking::query()->create([
+                'b_ref_no' => $this->newBookingReference(),
+                'guest_id' => $guest->guest_id,
+                'booking_date' => Carbon::today()->toDateString(),
+                'no_of_extra_guests' => $extraGuestCount,
+                'total_guest_count' => $totalGuestCount,
+                'total_price' => $total,
+                // Keep amount_due until cashier verifies the GCash proof.
+                'amount_due' => $total,
+                'user_id' => null,
+                'reservation_id' => null,
+                'entrance_slip_id' => null,
+                'status' => 'Pending Verification',
+            ]);
+
+            $detail = BookingDetail::query()->create([
+                'booking_id' => $booking->booking_id,
+                'facility_id' => $facilityId,
+                'rate_type' => $quote['rate_type'],
+                'check_in_date' => $checkInDate,
+                'check_out_date' => $checkOutDate,
+                'check_in_time' => $this->normalizeTime($data['check_in_time'] ?? '12:00'),
+                'status' => 'Pending Verification',
+                'discount_id' => null,
+                'user_id' => null,
+                ...$quote['detail_snapshot'],
+            ]);
+
+            $this->scheduleBlocks->acquireForBookingDetail($detail);
+
+            $this->detailGuests->createForBooking(
+                $booking,
+                $detail,
+                $extraGuests,
+            );
+
+            Payment::query()->create([
+                'p_ref_no' => $this->newPaymentReference(),
+                'booking_id' => $booking->booking_id,
+                'reservation_id' => null,
+                'entrance_slip_id' => null,
+                'mode_of_payment_id' => $mode->mode_of_payment_id,
+                'reference_number' => $referenceNumber,
+                'proof_of_payment_path' => $proofPath,
+                'amount_paid' => $paymentAmount,
+                'date_paid' => Carbon::today()->toDateString(),
+                'user_id' => null,
+                'payment_status' => 'Pending',
+                'verified_by_user_id' => null,
+                'verified_at' => null,
+            ]);
+
+            return $booking->fresh([
+                'guest.address',
+                'details.facility.facilityType',
+                'extraGuests',
+                'payments.modeOfPayment',
+            ]);
+        });
+
+        $this->confirmationEmailService->sendBookingSubmitted($booking);
+
+        return $booking;
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $extraGuests
+     * @return array<int, array{first_name: string, middle_name: ?string, last_name: string}>
+     */
+    private function cleanExtraGuests(array $extraGuests): array
+    {
+        $clean = [];
+
+        foreach ($extraGuests as $extraGuest) {
+            $firstName = trim((string) ($extraGuest['first_name'] ?? ''));
+            $middleName = trim((string) ($extraGuest['middle_name'] ?? ''));
+            $lastName = trim((string) ($extraGuest['last_name'] ?? ''));
+
+            if ($firstName === '' && $middleName === '' && $lastName === '') {
+                continue;
+            }
+
+            if ($firstName === '' || $lastName === '') {
+                throw new InvalidArgumentException('Each extra guest must have a first name and last name.');
+            }
+
+            $clean[] = [
+                'first_name' => $firstName,
+                'middle_name' => $middleName !== '' ? $middleName : null,
+                'last_name' => $lastName,
+            ];
+        }
+
+        return $clean;
+    }
+
+    private function normalizeTime(string $time): string
+    {
+        $time = trim($time);
+
+        if (preg_match('/^\d{2}:\d{2}$/', $time) === 1) {
+            return $time.':00';
+        }
+
+        return $time;
+    }
+
+    private function newBookingReference(): string
+    {
+        do {
+            $reference = 'B'.now()->format('ymdHis').strtoupper(Str::random(4));
+        } while (Booking::query()->where('b_ref_no', $reference)->exists());
+
+        return $reference;
+    }
+
+    private function newPaymentReference(): string
+    {
+        do {
+            $reference = 'P'.now()->format('ymdHis').strtoupper(Str::random(4));
+        } while (Payment::query()->where('p_ref_no', $reference)->exists());
+
+        return $reference;
+    }
+}

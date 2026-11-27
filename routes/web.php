@@ -1,0 +1,283 @@
+<?php
+
+use App\Http\Controllers\AmenityRequestPhotoController;
+use App\Http\Controllers\FacilityConditionPhotoController;
+use App\Http\Controllers\FacilityInspectionPhotoController;
+use App\Http\Controllers\GcashProofController;
+use App\Http\Controllers\PrintDocumentController;
+use App\Http\Controllers\RefundProofController;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Route;
+use Livewire\Volt\Volt;
+
+Volt::route('/login', 'auth.login')
+    ->middleware('guest')
+    ->name('login');
+
+Route::post('/logout', function (Request $request) {
+    Auth::guard('web')->logout();
+
+    $request->session()->invalidate();
+    $request->session()->regenerateToken();
+
+    return redirect()->route('login');
+})->middleware('auth')->name('logout');
+
+Volt::route('/forgot-password', 'auth.forgot-password')
+    ->middleware('guest')
+    ->name('password.request');
+
+Volt::route('/dashboard', 'dashboard')
+    ->middleware(['auth', 'active'])
+    ->name('dashboard');
+
+// Admin Routes
+Volt::route('/admin/dashboard', 'admin.dashboard')
+    ->middleware(['auth', 'active', 'role:Admin'])
+    ->name('admin.dashboard');
+
+Volt::route('/admin/entrance-fees', 'admin.entrance-fees.index')
+    ->middleware(['auth', 'active', 'role:Admin'])
+    ->name('admin.entrance-fees.index');
+
+Volt::route('/admin/discounts', 'admin.discounts.index')
+    ->middleware(['auth', 'active', 'role:Admin'])
+    ->name('admin.discounts.index');
+
+Volt::route('/admin/facilities', 'admin.facilities.index')
+    ->middleware(['auth', 'active', 'role:Admin'])
+    ->name('admin.facilities.index');
+
+Volt::route('/admin/facilities/create', 'admin.facilities.create')
+    ->middleware(['auth', 'active', 'role:Admin'])
+    ->name('admin.facilities.create');
+
+Volt::route('/admin/facilities/{facility}/edit', 'admin.facilities.edit')
+    ->middleware(['auth', 'active', 'role:Admin'])
+    ->name('admin.facilities.edit');
+
+Volt::route('/admin/amenities', 'admin.amenities.index')
+    ->middleware(['auth', 'active', 'role:Admin'])
+    ->name('admin.amenities.index');
+
+Volt::route('/admin/fines', 'admin.fines.index')
+    ->middleware(['auth', 'active', 'role:Admin'])
+    ->name('admin.fines.index');
+
+Volt::route('/admin/refund-requests', 'admin.refund-requests.index')
+    ->middleware(['auth', 'active', 'role:Admin'])
+    ->name('admin.refund-requests.index');
+
+Volt::route('/admin/users', 'admin.users.index')
+    ->middleware(['auth', 'active', 'role:Admin'])
+    ->name('admin.users.index');
+
+Volt::route('/admin/reports', 'admin.reports.index')
+    ->middleware(['auth', 'active', 'role:Admin'])
+    ->name('admin.reports.index');
+
+Volt::route('/admin/activity-logs', 'admin.activity-logs.index')
+    ->middleware(['auth', 'active', 'role:Admin'])
+    ->name('admin.activity-logs.index');
+
+// Cashier Routes
+Volt::route('/cashier/dashboard', 'cashier.dashboard')
+    ->middleware(['auth', 'active', 'role:Cashier'])
+    ->name('cashier.dashboard');
+
+Volt::route('/cashier/entrance-slips', 'cashier.entrance-slips.index')
+    ->middleware(['auth', 'active', 'role:Cashier'])
+    ->name('cashier.entrance-slips.index');
+
+Volt::route('/cashier/reservations', 'cashier.reservations.index')
+    ->middleware(['auth', 'active', 'role:Cashier'])
+    ->name('cashier.reservations.index');
+
+Volt::route('/cashier/reservations/create', 'cashier.reservations.create')
+    ->middleware(['auth', 'active', 'role:Cashier'])
+    ->name('cashier.reservations.create');
+
+Volt::route('/cashier/bookings', 'cashier.bookings.index')
+    ->middleware(['auth', 'active', 'role:Cashier'])
+    ->name('cashier.bookings.index');
+
+Volt::route('/cashier/bookings/create', 'cashier.bookings.create')
+    ->middleware(['auth', 'active', 'role:Cashier'])
+    ->name('cashier.bookings.create');
+
+Volt::route('/cashier/check-ins', 'cashier.check-ins.index')
+    ->middleware(['auth', 'active', 'role:Cashier'])
+    ->name('cashier.check-ins.index');
+
+Volt::route('/cashier/check-outs', 'cashier.check-outs.index')
+    ->middleware(['auth', 'active', 'role:Cashier'])
+    ->name('cashier.check-outs.index');
+
+Volt::route('/cashier/payments', 'cashier.payments.index')
+    ->middleware(['auth', 'active', 'role:Cashier'])
+    ->name('cashier.payments.index');
+
+Volt::route('/cashier/amenity-requests', 'cashier.amenity-requests.index')
+    ->middleware(['auth', 'active', 'role:Cashier'])
+    ->name('cashier.amenity-requests.index');
+
+Volt::route('/cashier/billings', 'cashier.billings.index')
+    ->middleware(['auth', 'active', 'role:Cashier'])
+    ->name('cashier.billings.index');
+
+Volt::route('/cashier/reports', 'cashier.reports.index')
+    ->middleware(['auth', 'active', 'role:Cashier'])
+    ->name('cashier.reports.index');
+
+Volt::route('/cashier/gcash-verifications', 'cashier.gcash-verifications.index')
+    ->middleware(['auth', 'active', 'role:Cashier'])
+    ->name('cashier.gcash-verifications.index');
+
+Volt::route('/cashier/reservation-conversions', 'cashier.reservation-conversions.index')
+    ->middleware(['auth', 'active', 'role:Cashier'])
+    ->name('cashier.reservation-conversions.index');
+
+Volt::route('/cashier/notifications', 'cashier.notifications.index')
+    ->middleware(['auth', 'active', 'role:Cashier'])
+    ->name('cashier.notifications.index');
+
+Volt::route('/cashier/action-center', 'cashier.action-center.index')
+    ->middleware(['auth', 'active', 'role:Cashier'])
+    ->name('cashier.action-center');
+
+Volt::route('/cashier/bookings/{booking}/details', 'cashier.bookings.show')
+    ->whereNumber('booking')
+    ->middleware(['auth', 'active', 'role:Cashier,Admin'])
+    ->name('cashier.bookings.show');
+
+// Maintenance Staff Routes
+Volt::route('/maintenance/dashboard', 'maintenance.dashboard')
+    ->middleware(['auth', 'active', 'role:Maintenance Staff'])
+    ->name('maintenance.dashboard');
+
+Volt::route('/maintenance/facility-checklist', 'maintenance.facility-inspections.index')
+    ->middleware(['auth', 'active', 'role:Maintenance Staff'])
+    ->name('maintenance.facility-inspections.index');
+
+Volt::route('/maintenance/facility-readiness', 'maintenance.facility-photos.index')
+    ->middleware(['auth', 'active', 'role:Maintenance Staff'])
+    ->name('maintenance.facility-photos.index');
+
+Volt::route('/maintenance/amenity-requests', 'maintenance.amenity-requests.index')
+    ->middleware(['auth', 'active', 'role:Maintenance Staff'])
+    ->name('maintenance.amenity-requests.index');
+
+Volt::route('/maintenance/notifications', 'maintenance.notifications.index')
+    ->middleware(['auth', 'active', 'role:Maintenance Staff'])
+    ->name('maintenance.notifications.index');
+
+Volt::route('/maintenance/action-center', 'maintenance.action-center.index')
+    ->middleware(['auth', 'active', 'role:Maintenance Staff'])
+    ->name('maintenance.action-center');
+
+Volt::route('/maintenance/create-amenity-request', 'maintenance.amenity-requests.index')
+    ->middleware(['auth', 'active', 'role:Maintenance Staff'])
+    ->name('maintenance.create-amenity-request.index');
+
+// Security Guard Routes
+Volt::route('/security/entrance-slips/create', 'security.entrance-slips.create')
+    ->middleware(['auth', 'active', 'role:Security Guard'])
+    ->name('security.entrance-slips.create');
+
+// Guest Routes
+Volt::route('/', 'guest.home')
+    ->name('guest.home');
+
+Volt::route('/reserve', 'guest.facilities.planner')
+    ->name('guest.reservations.create');
+
+
+Volt::route('/reservation/success', 'guest.reservations.success')
+    ->name('guest.reservations.success');
+
+Volt::route('/book', 'guest.facilities.planner')
+    ->name('guest.bookings.create');
+
+Volt::route('/booking/success', 'guest.bookings.success')
+    ->name('guest.bookings.success');
+
+Volt::route('/check-your-email', 'guest.submissions.sent')
+    ->name('guest.submissions.sent');
+
+Volt::route('/confirm-request/{token}', 'guest.submissions.confirm')
+    ->where('token', '[A-Za-z0-9]{64}')
+    ->name('guest.submissions.confirm');
+
+Volt::route('/manage', 'guest.reservations.manage')
+    ->name('guest.reservations.manage');
+
+// The old address keeps working for links people already have.
+Route::redirect('/reservation/manage', '/manage', 301);
+
+Volt::route('/confirmation', 'guest.confirmations.lookup')
+    ->name('guest.confirmations.lookup');
+
+// secure gcash routes
+Route::get(
+    '/secure/gcash-proofs/{payment}',
+    GcashProofController::class,
+)
+    ->whereNumber('payment')
+    ->middleware([
+        'auth',
+        'active',
+        'role:Admin,Cashier',
+    ])
+    ->name('payments.gcash-proof');
+
+// secure refund proof (GCash refund screenshot attached by the cashier)
+Route::get(
+    '/secure/refund-proofs/{refundRequest}',
+    RefundProofController::class,
+)
+    ->whereNumber('refundRequest')
+    ->middleware([
+        'auth',
+        'active',
+        'role:Admin,Cashier',
+    ])
+    ->name('refunds.proof');
+
+// secure photo routes (inspection damage, facility condition, amenity delivery proof)
+Route::middleware(['auth', 'active', 'role:Admin,Cashier,Maintenance Staff'])->group(function () {
+    Route::get('/secure/inspection-photos/{photo}', FacilityInspectionPhotoController::class)
+        ->whereNumber('photo')
+        ->name('facility-inspection-photos.show');
+
+    Route::get('/secure/facility-photos/{photo}', FacilityConditionPhotoController::class)
+        ->whereNumber('photo')
+        ->name('facility-condition-photos.show');
+
+    Route::get('/secure/amenity-request-photos/{photo}', AmenityRequestPhotoController::class)
+        ->whereNumber('photo')
+        ->name('amenity-request-photos.show');
+});
+
+// Print
+Route::middleware(['auth', 'active'])->prefix('print')->name('print.')->group(function () {
+    Route::get('/entrance-slip/{entranceSlip}', [PrintDocumentController::class, 'entranceSlip'])
+        ->middleware('role:Admin,Cashier,Security Guard')
+        ->name('entrance-slip');
+
+    Route::get('/reservation/{reservation}', [PrintDocumentController::class, 'reservationConfirmation'])
+        ->middleware('role:Admin,Cashier')
+        ->name('reservation');
+
+    Route::get('/booking/{booking}', [PrintDocumentController::class, 'bookingConfirmation'])
+        ->middleware('role:Admin,Cashier')
+        ->name('booking');
+
+    Route::get('/payment/{payment}', [PrintDocumentController::class, 'paymentReceipt'])
+        ->middleware('role:Admin,Cashier')
+        ->name('payment');
+
+    Route::get('/billing/{booking}', [PrintDocumentController::class, 'billingStatement'])
+        ->middleware('role:Admin,Cashier')
+        ->name('billing');
+});

@@ -1,0 +1,2080 @@
+<?php
+
+use App\Models\BookingDetail;
+use App\Models\FacilityInspection;
+use App\Models\FacilityInspectionPhoto;
+use App\Models\FacilityInspectionRequest;
+use App\Models\Fine;
+use App\Models\GuestFine;
+use App\Models\InspectionDraftFine;
+use App\Services\CheckOutInspectionRequestService;
+use App\Services\FacilityInspectionPhotoService;
+use App\Services\FacilityInspectionWorkflowService;
+use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Pagination\LengthAwarePaginator;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Validation\ValidationException;
+use Livewire\Attributes\Layout;
+use Livewire\Attributes\Title;
+use Livewire\Attributes\Url;
+use Livewire\Volt\Component;
+use Livewire\WithFileUploads;
+use Livewire\WithPagination;
+
+new #[Layout('layouts.app')] #[Title('Facility Checklists - Olaer Spring Resort')] class extends Component
+{
+
+    public function updated(string $property): void
+    {
+        // Clear the red highlight of a field as soon as the user edits it.
+        $this->resetValidation($property);
+    }
+
+    /** Error text for a required field; an empty required field only turns red (no text). */
+    public function visibleError(string $field): ?string
+    {
+        $message = $this->getErrorBag()->first($field);
+
+        if ($message === '') {
+            return null;
+        }
+
+        $value = data_get($this, $field);
+
+        return $value === null || $value === '' || $value === [] ? null : $message;
+    }
+    use WithFileUploads;
+    use WithPagination;
+
+    #[Url(as: 'q', except: '')]
+    public string $search = '';
+
+    #[Url(as: 'status', except: 'all')]
+    public string $statusFilter = 'all';
+
+    #[Url(as: 'assignment', except: '')]
+    public string $assignmentFilter = '';
+
+    #[Url(as: 'departure', except: 'all')]
+    public string $dateFilter = 'all';
+
+    #[Url(as: 'sort', except: 'requested_at')]
+    public string $sortField = 'requested_at';
+
+    #[Url(as: 'direction', except: 'asc')]
+    public string $sortDirection = 'asc';
+
+    #[Url(as: 'per_page', except: 10)]
+    public int $perPage = 10;
+
+    public ?int $selectedRequestId = null;
+    public ?int $selectedBookingDetailsId = null;
+    public ?int $selectedBookingId = null;
+    public string $selectedLabel = '';
+    public string $selectedChecklistKey = '';
+    public ?int $fineId = null;
+    public int $fineQuantity = 1;
+    public string $remarks = '';
+
+    /** Photos picked by the maintenance staff; saved right after they upload. */
+    public array $photos = [];
+
+    /** One file at a time: the bucket (S3) upload driver does not accept multiple files. */
+    public $photo = null;
+    public ?string $pendingCompletion = null;
+    public bool $showCompletionDialog = false;
+
+    public function mount(): void
+    {
+        $requestId = request()->integer('request');
+
+        if ($requestId > 0) {
+            $this->selectRequest($requestId);
+        }
+    }
+
+    public function with(): array
+    {
+        return [
+            'inspectionRequests' => $this->inspectionRequests(),
+            'fines' => $this->fines(),
+            'quantityLocked' => $this->isSituationalFine(),
+            'selectedChecklistItems' => $this->selectedChecklistItems(),
+            'selectedGuestFines' => $this->selectedGuestFines(),
+            'selectedDraftFines' => $this->selectedDraftFines(),
+            'inspectionPhotos' => $this->inspectionPhotos(),
+            'selectedInspection' => $this->selectedInspection(),
+            'selectedInspectionRequest' =>
+                $this->selectedInspectionRequest(),
+        ];
+    }
+
+    public function updatedSearch(): void
+    {
+        $this->resetPage();
+    }
+
+    public function updatedStatusFilter(): void
+    {
+        $this->cancelSelection();
+        $this->resetPage();
+    }
+
+    public function updatedAssignmentFilter(): void
+    {
+        $this->cancelSelection();
+        $this->resetPage();
+    }
+
+    public function updatedDateFilter(): void
+    {
+        $this->cancelSelection();
+        $this->resetPage();
+    }
+
+    public function updatedPerPage(): void
+    {
+        if (! in_array($this->perPage, [10, 25, 50, 100], true)) {
+            $this->perPage = 10;
+        }
+
+        $this->resetPage();
+    }
+
+    public function updatedSelectedChecklistKey(): void
+    {
+        $this->fineId = null;
+
+        // Keep the quantity inside the new item's limit.
+        $this->fineQuantity = min(
+            max($this->fineQuantity, 1),
+            $this->fineQuantityLimit($this->selectedChecklistItems()),
+        );
+    }
+
+    /**
+     * Most units one fine can cover: what the selected checklist item expects
+     * (the facility's inclusive amount, or what was delivered for a request).
+     * A situational fine has no item and is always charged as 1.
+     *
+     * @param  array<int, array<string, mixed>>  $items
+     */
+    public function fineQuantityLimit(array $items): int
+    {
+        if ($this->isSituationalFine()) {
+            return 1;
+        }
+
+        $selected = collect($items)->firstWhere('key', $this->selectedChecklistKey);
+
+        return $selected === null ? 100 : max((int) $selected['expected_quantity'], 1);
+    }
+
+    /**
+     * With no checklist item selected only situational fines are offered (see fines()).
+     * They are not tied to an item or an amenity, so the quantity is locked at 1.
+     */
+    private function isSituationalFine(): bool
+    {
+        return trim($this->selectedChecklistKey) === '';
+    }
+
+    public function clearFilters(): void
+    {
+        $this->search = '';
+        $this->statusFilter = 'all';
+        $this->assignmentFilter = '';
+        $this->dateFilter = 'all';
+        $this->sortField = 'requested_at';
+        $this->sortDirection = 'asc';
+        $this->perPage = 10;
+
+        $this->cancelSelection();
+        $this->resetPage();
+    }
+
+    public function sortBy(string $field): void
+    {
+        $allowed = [
+            'facility_inspection_request_id',
+            'requested_at',
+            'b_ref_no',
+            'guest_name',
+            'facility_name',
+            'check_out_date',
+            'request_status',
+            'assigned_to',
+        ];
+
+        if (! in_array($field, $allowed, true)) {
+            return;
+        }
+
+        if ($this->sortField === $field) {
+            $this->sortDirection =
+                $this->sortDirection === 'asc' ? 'desc' : 'asc';
+        } else {
+            $this->sortField = $field;
+            $this->sortDirection = in_array(
+                $field,
+                [
+                    'facility_inspection_request_id',
+                    'requested_at',
+                ],
+                true,
+            )
+                ? 'desc'
+                : 'asc';
+        }
+
+        $this->resetPage();
+    }
+
+    public function selectRequest(int $requestId): void
+    {
+        try {
+            $request = FacilityInspectionRequest::query()
+                ->with([
+                    'booking.guest',
+                    'bookingDetail',
+                    'facility',
+                    'assignedTo',
+                    'inspection',
+                ])
+                ->findOrFail($requestId);
+
+            if ($request->status === 'Cancelled') {
+                throw ValidationException::withMessages([
+                    'inspection' =>
+                        'Cancelled inspection requests cannot be opened.',
+                ]);
+            }
+
+            if (
+                $request->assigned_to_user_id !== null
+                && (int) $request->assigned_to_user_id !== (int) Auth::id()
+                && $request->status !== 'Completed'
+            ) {
+                throw ValidationException::withMessages([
+                    'inspection' =>
+                        'This inspection request is assigned to another maintenance staff member.',
+                ]);
+            }
+
+            if (
+                $request->status === 'Pending'
+                || (
+                    $request->status === 'In Progress'
+                    && $request->assigned_to_user_id === null
+                )
+            ) {
+                $request = app(
+                    CheckOutInspectionRequestService::class,
+                )->acceptRequest(
+                    $requestId,
+                    (int) Auth::id(),
+                );
+            }
+
+            $detail = BookingDetail::query()
+                ->with([
+                    'booking.guest',
+                    'facility',
+                ])
+                ->findOrFail(
+                    (int) $request->booking_details_id,
+                );
+
+            if (
+                $request->status !== 'Completed'
+                && $detail->status !== 'Checked-in'
+            ) {
+                throw ValidationException::withMessages([
+                    'inspection' =>
+                        'Only checked-in facility details can be inspected.',
+                ]);
+            }
+
+            $guest = $detail->booking?->guest;
+            $facilityName =
+                $detail->facility?->facility_name
+                ?? 'No facility';
+
+            $this->selectedRequestId =
+                (int) $request->facility_inspection_request_id;
+            $this->selectedBookingDetailsId =
+                (int) $detail->booking_details_id;
+            $this->selectedBookingId =
+                (int) $detail->booking_id;
+            $this->selectedLabel =
+                ($detail->booking?->b_ref_no ?? 'Unknown booking')
+                .' — '
+                .trim(
+                    ($guest?->first_name ?? '')
+                    .' '
+                    .($guest?->last_name ?? '')
+                )
+                .' — '
+                .$facilityName;
+
+            $this->photos = [];
+            $this->selectedChecklistKey = '';
+            $this->fineId = null;
+            $this->fineQuantity = 1;
+            $this->remarks = (string) (
+                $request->inspection?->remarks
+                ?? ''
+            );
+
+            $this->resetValidation();
+        } catch (\Throwable $exception) {
+            $this->toastError($exception->getMessage());
+        }
+    }
+
+    public function cancelSelection(): void
+    {
+        $this->selectedRequestId = null;
+        $this->selectedBookingDetailsId = null;
+        $this->selectedBookingId = null;
+        $this->selectedLabel = '';
+        $this->selectedChecklistKey = '';
+        $this->fineId = null;
+        $this->fineQuantity = 1;
+        $this->remarks = '';
+        $this->photos = [];
+
+        $this->resetValidation();
+    }
+
+    /**
+     * Show an error as a toast. Only lasts for this request, so it is never
+     * repeated on the next interaction.
+     */
+    private function toastError(string $message): void
+    {
+        session()->now('error', $message);
+    }
+
+    private function hasDraftFines(): bool
+    {
+        return $this->selectedDraftFines()->contains(
+            fn (InspectionDraftFine $draft): bool => $draft->status === 'Draft',
+        );
+    }
+
+    public function requestCompletion(string $type): void
+    {
+        if (! in_array($type, ['no_damage', 'publish_fines'], true)) {
+            return;
+        }
+
+        if ($type === 'no_damage' && $this->hasDraftFines()) {
+            $this->toastError('Remove all draft fines before completing the inspection as no damage.');
+
+            return;
+        }
+
+        $this->pendingCompletion = $type;
+        $this->showCompletionDialog = true;
+    }
+
+    public function confirmCompletion(
+        FacilityInspectionWorkflowService $inspectionWorkflow,
+    ): void {
+        $type = $this->pendingCompletion;
+        $this->showCompletionDialog = false;
+        $this->pendingCompletion = null;
+
+        if ($type === 'no_damage') {
+            $this->markNoDamage($inspectionWorkflow);
+
+            return;
+        }
+
+        if ($type === 'publish_fines') {
+            $this->completeInspection($inspectionWorkflow);
+        }
+    }
+
+    public function markNoDamage(
+        FacilityInspectionWorkflowService $inspectionWorkflow,
+    ): void {
+        $validated = $this->validate([
+            'selectedBookingDetailsId' => [
+                'required',
+                'integer',
+                'exists:tbl_booking_details,booking_details_id',
+            ],
+            'remarks' => [
+                'nullable',
+                'string',
+                'max:1000',
+            ],
+        ]);
+
+        try {
+            $this->guardCanMarkNoDamage();
+
+            $inspectionWorkflow->markNoDamage(
+                (int) $validated['selectedBookingDetailsId'],
+                (int) Auth::id(),
+                trim((string) $validated['remarks']) !== ''
+                    ? trim((string) $validated['remarks'])
+                    : null,
+            );
+
+            session()->flash(
+                'success',
+                'Inspection cleared. The cashier may proceed when the booking balance is zero.',
+            );
+        } catch (\Throwable $exception) {
+            $this->toastError($exception->getMessage());
+        }
+    }
+
+    public function addFine(
+        FacilityInspectionWorkflowService $inspectionWorkflow,
+    ): void {
+        if ($this->isSituationalFine()) {
+            $this->fineQuantity = 1; // locked: a situational fine is always charged as 1
+        }
+
+        $quantityLimit = $this->fineQuantityLimit($this->selectedChecklistItems());
+
+        $validated = $this->validate([
+            'selectedBookingDetailsId' => [
+                'required',
+                'integer',
+                'exists:tbl_booking_details,booking_details_id',
+            ],
+            'selectedChecklistKey' => [
+                'nullable',
+                'string',
+                'max:80',
+            ],
+            'fineId' => [
+                'required',
+                'integer',
+                'exists:tbl_fine,fine_id',
+            ],
+            'fineQuantity' => [
+                'required',
+                'integer',
+                'min:1',
+                'max:'.$quantityLimit,
+            ],
+            'remarks' => [
+                'nullable',
+                'string',
+                'max:1000',
+            ],
+        ], [
+            'fineQuantity.required' => 'Enter the quantity.',
+            'fineQuantity.integer' => 'The quantity must be a whole number.',
+            'fineQuantity.min' => 'The quantity must be at least 1.',
+            'fineQuantity.max' => "The quantity cannot be more than {$quantityLimit} for this item.",
+        ]);
+
+        try {
+            $this->guardCanRecordFine();
+
+            if (! $this->fines()->contains('fine_id', (int) $validated['fineId'])) {
+                throw new \InvalidArgumentException(
+                    'The selected fine does not match the selected checklist item.'
+                );
+            }
+
+            [$source, $sourceId] = $this->parseChecklistKey(
+                (string) (
+                    $validated['selectedChecklistKey']
+                    ?? ''
+                ),
+            );
+
+            $inspectionWorkflow->recordFine(
+                (int) $validated['selectedBookingDetailsId'],
+                (int) $validated['fineId'],
+                (int) $validated['fineQuantity'],
+                (int) Auth::id(),
+                trim((string) $validated['remarks']) !== ''
+                    ? trim((string) $validated['remarks'])
+                    : null,
+                $source,
+                $sourceId,
+            );
+
+            $this->fineId = null;
+            $this->fineQuantity = 1;
+
+            session()->flash(
+                'success',
+                'Fine saved as draft. It will not affect cashier billing until Complete Inspection.',
+            );
+        } catch (\Throwable $exception) {
+            $this->toastError($exception->getMessage());
+        }
+    }
+
+    public function completeInspection(
+        FacilityInspectionWorkflowService $inspectionWorkflow,
+    ): void {
+        if ($this->selectedBookingDetailsId === null) {
+            return;
+        }
+
+        try {
+            $inspectionWorkflow->completeInspection(
+                $this->selectedBookingDetailsId,
+                (int) Auth::id(),
+                trim($this->remarks) !== '' ? trim($this->remarks) : null,
+            );
+
+            session()->flash(
+                'success',
+                'Inspection completed. Draft fines are now posted to cashier billing and locked.',
+            );
+        } catch (\Throwable $exception) {
+            $this->toastError($exception->getMessage());
+        }
+    }
+
+    public function removeDraftFine(
+        int $draftFineId,
+        FacilityInspectionWorkflowService $inspectionWorkflow,
+    ): void {
+        try {
+            $inspectionWorkflow->removeDraftFine(
+                $draftFineId,
+                (int) Auth::id(),
+            );
+
+            session()->flash('success', 'Draft fine removed.');
+        } catch (\Throwable $exception) {
+            $this->toastError($exception->getMessage());
+        }
+    }
+
+    public function updatedPhoto(FacilityInspectionPhotoService $photoService): void
+    {
+        if ($this->photo === null) {
+            return;
+        }
+
+        $this->photos = [$this->photo];
+        $this->photo = null;
+
+        $this->updatedPhotos($photoService);
+    }
+
+    /** Save photos as soon as they are chosen (max 10 per inspection, 64 MB each). */
+    public function updatedPhotos(FacilityInspectionPhotoService $photoService): void
+    {
+        $this->resetErrorBag(['photos', 'photos.*', 'inspection']);
+
+        if ($this->selectedRequestId === null || $this->photos === []) {
+            $this->photos = [];
+
+            return;
+        }
+
+        try {
+            $this->validate([
+                'photos' => ['array', 'max:'.FacilityInspectionPhotoService::MAX_PHOTOS],
+                'photos.*' => [
+                    'file',
+                    'mimes:jpg,jpeg,png,webp',
+                    'max:'.FacilityInspectionPhotoService::MAX_KILOBYTES,
+                ],
+            ], [
+                'photos.max' => 'Choose up to '.FacilityInspectionPhotoService::MAX_PHOTOS.' photos at a time.',
+                'photos.*.mimes' => 'Photos must be JPG, PNG or WebP images.',
+                'photos.*.max' => 'Each photo must be 64 MB or smaller.',
+                'photos.*.file' => 'One of the chosen files could not be uploaded.',
+            ]);
+
+            $this->guardCanRecordFine();
+
+            $photoService->store(
+                $this->selectedRequestId,
+                array_values($this->photos),
+                (int) Auth::id(),
+            );
+
+            session()->flash('success', 'Damage photo(s) uploaded.');
+        } catch (ValidationException $exception) {
+            throw $exception;
+        } catch (\Throwable $exception) {
+            $this->addError('photos', $exception->getMessage());
+        } finally {
+            $this->photos = [];
+        }
+    }
+
+    public function deletePhoto(
+        int $photoId,
+        FacilityInspectionPhotoService $photoService,
+    ): void {
+        try {
+            $photoService->delete($photoId, (int) Auth::id());
+
+            session()->flash('success', 'Photo removed.');
+        } catch (\Throwable $exception) {
+            $this->addError('photos', $exception->getMessage());
+        }
+    }
+
+    private function inspectionPhotos(): Collection
+    {
+        if ($this->selectedRequestId === null) {
+            return new Collection();
+        }
+
+        return FacilityInspectionPhoto::query()
+            ->with('uploadedBy')
+            ->where('facility_inspection_request_id', $this->selectedRequestId)
+            ->orderBy('facility_inspection_photo_id')
+            ->get();
+    }
+
+    public function canMarkNoDamage(): bool
+    {
+        $request = $this->selectedInspectionRequest();
+
+        return $request !== null
+            && $request->status === 'In Progress'
+            && (int) $request->assigned_to_user_id
+                === (int) Auth::id();
+    }
+
+    public function canRecordFine(): bool
+    {
+        $request = $this->selectedInspectionRequest();
+        $inspection = $this->selectedInspection();
+
+        if (
+            $request === null
+            || (int) $request->assigned_to_user_id
+                !== (int) Auth::id()
+        ) {
+            return false;
+        }
+
+        return $request->status === 'In Progress';
+    }
+
+    public function requestStatusColor(string $status): string
+    {
+        return \App\Support\StatusColor::for($status);
+    }
+
+    public function inspectionStatusColor(?string $status): string
+    {
+        return \App\Support\StatusColor::for($status);
+    }
+
+    public function sortIndicator(string $field): string
+    {
+        if ($this->sortField !== $field) {
+            return '↕';
+        }
+
+        return $this->sortDirection === 'asc'
+            ? '↑'
+            : '↓';
+    }
+
+    public function staffName(
+        mixed $staff,
+        string $fallback = 'Unassigned',
+    ): string {
+        if ($staff === null) {
+            return $fallback;
+        }
+
+        return $staff->full_name
+            ?? trim(implode(' ', array_filter([
+                $staff->first_name,
+                $staff->middle_name,
+                $staff->last_name,
+            ])))
+            ?: ($staff->username ?? $fallback);
+    }
+
+    public function formatFineLabel(?Fine $fine): string
+    {
+        if ($fine === null) {
+            return 'Unknown fine';
+        }
+
+        $charge =
+            '₱'.number_format(
+                (float) $fine->fine_charge,
+                2,
+            );
+
+        if (
+            in_array(
+                (string) $fine->fine_type,
+                ['Amenity', 'Amenity Fine'],
+                true,
+            )
+        ) {
+            $amenityLabel =
+                $fine->amenity?->amenityName?->amenity_name
+                ?? 'Amenity';
+
+            $damageLabel =
+                $fine->damageType?->damage_type
+                ?? 'Damage';
+
+            return $amenityLabel
+                .' / '
+                .$damageLabel
+                .' — '
+                .$charge;
+        }
+
+        return (
+            $fine->situational_fine
+            ?? 'Situational fine'
+        )
+            .' — '
+            .$charge;
+    }
+
+    private function guardCanMarkNoDamage(): void
+    {
+        if (! $this->canMarkNoDamage()) {
+            throw ValidationException::withMessages([
+                'inspection' =>
+                    'Only the assigned maintenance staff can clear an active inspection.',
+            ]);
+        }
+    }
+
+    private function guardCanRecordFine(): void
+    {
+        if (! $this->canRecordFine()) {
+            throw ValidationException::withMessages([
+                'inspection' =>
+                    'Only the assigned maintenance staff can record fines for this inspection.',
+            ]);
+        }
+    }
+
+    private function parseChecklistKey(
+        string $key,
+    ): array {
+        if ($key === '') {
+            return [null, null];
+        }
+
+        $parts = explode(':', $key, 2);
+
+        if (
+            count($parts) !== 2
+            || ! in_array(
+                $parts[0],
+                [
+                    'facility_amenity',
+                    'amenity_request',
+                ],
+                true,
+            )
+            || (int) $parts[1] < 1
+        ) {
+            throw new \InvalidArgumentException(
+                'Invalid checklist item selection.',
+            );
+        }
+
+        return [
+            $parts[0],
+            (int) $parts[1],
+        ];
+    }
+
+    private function inspectionRequests(): LengthAwarePaginator
+    {
+        $allowedSorts = [
+            'facility_inspection_request_id',
+            'requested_at',
+            'b_ref_no',
+            'guest_name',
+            'facility_name',
+            'check_out_date',
+            'request_status',
+            'assigned_to',
+        ];
+
+        $sortField = in_array(
+            $this->sortField,
+            $allowedSorts,
+            true,
+        )
+            ? $this->sortField
+            : 'requested_at';
+
+        $direction =
+            $this->sortDirection === 'desc'
+                ? 'desc'
+                : 'asc';
+
+        $perPage = in_array(
+            $this->perPage,
+            [10, 25, 50, 100],
+            true,
+        )
+            ? $this->perPage
+            : 10;
+
+        $query = FacilityInspectionRequest::query()
+            ->select(
+                'tbl_facility_inspection_request.*',
+            )
+            ->join(
+                'tbl_booking',
+                'tbl_booking.booking_id',
+                '=',
+                'tbl_facility_inspection_request.booking_id',
+            )
+            ->join(
+                'tbl_booking_details',
+                'tbl_booking_details.booking_details_id',
+                '=',
+                'tbl_facility_inspection_request.booking_details_id',
+            )
+            ->join(
+                'tbl_guest',
+                'tbl_guest.guest_id',
+                '=',
+                'tbl_booking.guest_id',
+            )
+            ->leftJoin(
+                'tbl_facility',
+                'tbl_facility.facility_id',
+                '=',
+                'tbl_facility_inspection_request.facility_id',
+            )
+            ->leftJoin(
+                'tbl_user as requested_user',
+                'requested_user.user_id',
+                '=',
+                'tbl_facility_inspection_request.requested_by_user_id',
+            )
+            ->leftJoin(
+                'tbl_user as assigned_user',
+                'assigned_user.user_id',
+                '=',
+                'tbl_facility_inspection_request.assigned_to_user_id',
+            )
+            ->with([
+                'booking.guest',
+                'bookingDetail',
+                'facility.facilityType',
+                'requestedBy',
+                'assignedTo',
+                'inspection.inspectedBy',
+            ]);
+
+        if ($this->statusFilter === 'pending') {
+            $query->where(
+                'tbl_facility_inspection_request.status',
+                'Pending',
+            );
+        } elseif ($this->statusFilter === 'in_progress') {
+            $query->where(
+                'tbl_facility_inspection_request.status',
+                'In Progress',
+            );
+        } elseif ($this->statusFilter === 'completed') {
+            $query->where(
+                'tbl_facility_inspection_request.status',
+                'Completed',
+            );
+        } else {
+            $query->whereIn(
+                'tbl_facility_inspection_request.status',
+                [
+                    'Pending',
+                    'In Progress',
+                ],
+            );
+        }
+        if ($this->statusFilter === 'all'){
+            $query;
+        }
+        if ($this->statusFilter !== 'completed') {
+            $query->where(
+                'tbl_booking_details.status',
+                'Checked-in',
+            );
+        }
+
+        if ($this->assignmentFilter === 'unassigned') {
+            $query
+                ->where(
+                    'tbl_facility_inspection_request.status',
+                    'Pending',
+                )
+                ->whereNull(
+                    'tbl_facility_inspection_request.assigned_to_user_id',
+                );
+        } elseif ($this->assignmentFilter === 'mine') {
+            $query->where(
+                'tbl_facility_inspection_request.assigned_to_user_id',
+                Auth::id(),
+            );
+        } elseif ($this->assignmentFilter === 'other') {
+            $query
+                ->whereNotNull(
+                    'tbl_facility_inspection_request.assigned_to_user_id',
+                )
+                ->where(
+                    'tbl_facility_inspection_request.assigned_to_user_id',
+                    '!=',
+                    Auth::id(),
+                );
+        }
+
+        if ($this->dateFilter === 'today') {
+            $query->whereDate(
+                'tbl_booking_details.check_out_date',
+                now()->toDateString(),
+            );
+        } elseif ($this->dateFilter === 'upcoming') {
+            $query->whereDate(
+                'tbl_booking_details.check_out_date',
+                '>',
+                now()->toDateString(),
+            );
+        } elseif ($this->dateFilter === 'overdue') {
+            $query->whereDate(
+                'tbl_booking_details.check_out_date',
+                '<',
+                now()->toDateString(),
+            );
+        }
+
+        $searchText = trim($this->search);
+
+        if ($searchText !== '') {
+            $needle = '%'.$searchText.'%';
+            $numeric = ctype_digit($searchText)
+                ? (int) $searchText
+                : null;
+
+            $query->where(
+                function ($query) use (
+                    $needle,
+                    $numeric,
+                ): void {
+                    $query
+                        ->where(
+                            'tbl_booking.b_ref_no',
+                            'like',
+                            $needle,
+                        )
+                        ->orWhere(
+                            'tbl_guest.first_name',
+                            'like',
+                            $needle,
+                        )
+                        ->orWhere(
+                            'tbl_guest.middle_name',
+                            'like',
+                            $needle,
+                        )
+                        ->orWhere(
+                            'tbl_guest.last_name',
+                            'like',
+                            $needle,
+                        )
+                        ->orWhereRaw(\App\Support\NameSearch::sql('tbl_guest.first_name', 'tbl_guest.middle_name', 'tbl_guest.last_name'), \App\Support\NameSearch::bindings($needle))
+                        ->orWhere(
+                            'tbl_guest.contact_no',
+                            'like',
+                            $needle,
+                        )
+                        ->orWhere(
+                            'tbl_guest.email',
+                            'like',
+                            $needle,
+                        )
+                        ->orWhere(
+                            'tbl_facility.facility_name',
+                            'like',
+                            $needle,
+                        )
+                        ->orWhere(
+                            'requested_user.first_name',
+                            'like',
+                            $needle,
+                        )
+                        ->orWhere(
+                            'requested_user.last_name',
+                            'like',
+                            $needle,
+                        )
+                        ->orWhereRaw(\App\Support\NameSearch::sql('requested_user.first_name', 'requested_user.middle_name', 'requested_user.last_name'), \App\Support\NameSearch::bindings($needle))
+                        ->orWhere(
+                            'assigned_user.first_name',
+                            'like',
+                            $needle,
+                        )
+                        ->orWhere(
+                            'assigned_user.last_name',
+                            'like',
+                            $needle,
+                        )
+                        ->orWhereRaw(\App\Support\NameSearch::sql('assigned_user.first_name', 'assigned_user.middle_name', 'assigned_user.last_name'), \App\Support\NameSearch::bindings($needle));
+
+                    if ($numeric !== null) {
+                        $query->orWhere(
+                            'tbl_facility_inspection_request.facility_inspection_request_id',
+                            $numeric,
+                        );
+                    }
+                },
+            );
+        }
+
+        match ($sortField) {
+            'facility_inspection_request_id' =>
+                $query->orderBy(
+                    'tbl_facility_inspection_request.facility_inspection_request_id',
+                    $direction,
+                ),
+            'b_ref_no' =>
+                $query->orderBy(
+                    'tbl_booking.b_ref_no',
+                    $direction,
+                ),
+            'guest_name' =>
+                $query
+                    ->orderBy(
+                        'tbl_guest.last_name',
+                        $direction,
+                    )
+                    ->orderBy(
+                        'tbl_guest.first_name',
+                        $direction,
+                    ),
+            'facility_name' =>
+                $query->orderBy(
+                    'tbl_facility.facility_name',
+                    $direction,
+                ),
+            'check_out_date' =>
+                $query->orderBy(
+                    'tbl_booking_details.check_out_date',
+                    $direction,
+                ),
+            'request_status' =>
+                $query->orderBy(
+                    'tbl_facility_inspection_request.status',
+                    $direction,
+                ),
+            'assigned_to' =>
+                $query
+                    ->orderBy(
+                        'assigned_user.last_name',
+                        $direction,
+                    )
+                    ->orderBy(
+                        'assigned_user.first_name',
+                        $direction,
+                    ),
+            default =>
+                $query->orderBy(
+                    'tbl_facility_inspection_request.requested_at',
+                    $direction,
+                ),
+        };
+
+        return $query
+            ->orderBy(
+                'tbl_facility_inspection_request.facility_inspection_request_id',
+            )
+            ->paginate($perPage);
+    }
+
+    private function fines(): Collection
+    {
+        $query = Fine::query()
+            ->with([
+                'amenity.amenityName',
+                'damageType',
+            ]);
+
+        if (trim($this->selectedChecklistKey) === '') {
+            // No checklist item selected: situational fines only.
+            $query->where('fine_type', 'Situational');
+        } else {
+            $selectedItem = $this->selectedBookingDetailsId === null
+                ? null
+                : collect($this->selectedChecklistItems())->firstWhere(
+                    'key',
+                    $this->selectedChecklistKey,
+                );
+
+            if ($selectedItem === null) {
+                // Unknown checklist key: never fall back to every fine.
+                $query->whereRaw('1 = 0');
+            } else {
+                $query
+                    ->whereIn('fine_type', ['Amenity', 'Amenity Fine'])
+                    ->where('amenity_id', $selectedItem['amenity_id']);
+            }
+        }
+
+        return $query
+            ->orderBy('fine_type')
+            ->orderBy('fine_id')
+            ->get();
+    }
+
+    private function selectedChecklistItems(): array
+    {
+        if ($this->selectedBookingDetailsId === null) {
+            return [];
+        }
+
+        $items = app(
+            FacilityInspectionWorkflowService::class,
+        )->checklistFor(
+            $this->selectedBookingDetailsId,
+        );
+
+        return array_map(
+            function (array $item): array {
+                $item['fine_count'] = Fine::query()
+                    ->whereIn(
+                        'fine_type',
+                        [
+                            'Amenity',
+                            'Amenity Fine',
+                        ],
+                    )
+                    ->where(
+                        'amenity_id',
+                        $item['amenity_id'],
+                    )
+                    ->count();
+
+                return $item;
+            },
+            $items,
+        );
+    }
+
+    private function selectedDraftFines(): Collection
+    {
+        if ($this->selectedRequestId === null) {
+            return new Collection();
+        }
+
+        return InspectionDraftFine::query()
+            ->with([
+                'fine.amenity.amenityName',
+                'fine.damageType',
+                'createdBy',
+                'updatedBy',
+            ])
+            ->where(
+                'facility_inspection_request_id',
+                $this->selectedRequestId,
+            )
+            ->orderBy('inspection_draft_fine_id')
+            ->get();
+    }
+
+    private function selectedGuestFines(): Collection
+    {
+        if (
+            $this->selectedBookingId === null
+            || $this->selectedBookingDetailsId === null
+        ) {
+            return new Collection();
+        }
+
+        $detail = BookingDetail::query()
+            ->find(
+                $this->selectedBookingDetailsId,
+            );
+
+        if ($detail === null) {
+            return new Collection();
+        }
+
+        return GuestFine::query()
+            ->with([
+                'fine.amenity.amenityName',
+                'fine.damageType',
+                'facility',
+                'reportedBy',
+            ])
+            ->where(
+                'booking_id',
+                $this->selectedBookingId,
+            )
+            ->where(
+                'facility_id',
+                $detail->facility_id,
+            )
+            ->latest('guest_fine_id')
+            ->get();
+    }
+
+    private function selectedInspection(): ?FacilityInspection
+    {
+        if ($this->selectedBookingDetailsId === null) {
+            return null;
+        }
+
+        return FacilityInspection::query()
+            ->with([
+                'inspectedBy',
+                'items.amenity.amenityName',
+                'items.fine.damageType',
+            ])
+            ->where(
+                'booking_details_id',
+                $this->selectedBookingDetailsId,
+            )
+            ->first();
+    }
+
+    private function selectedInspectionRequest(): ?FacilityInspectionRequest
+    {
+        if ($this->selectedRequestId === null) {
+            return null;
+        }
+
+        return FacilityInspectionRequest::query()
+            ->with([
+                'booking.guest',
+                'bookingDetail',
+                'facility',
+                'requestedBy',
+                'assignedTo',
+                'inspection.inspectedBy',
+            ])
+            ->find($this->selectedRequestId);
+    }
+};
+
+?>
+
+<div class="space-y-6" wire:poll.15s.visible>
+    <x-staff-page-header
+        eyebrow="Maintenance operations"
+        title="Facility Checklists"
+        description="Accept only cashier-requested inspections, inspect the correct facility, and send fines to billing."
+    >
+        <x-slot:actions>
+            @if (Route::has('maintenance.dashboard'))
+                <flux:button
+                    href="{{ route('maintenance.dashboard') }}"
+                    wire:navigate
+                    variant="ghost"
+                >
+                    Back to Dashboard
+                </flux:button>
+            @endif
+        </x-slot:actions>
+    </x-staff-page-header>
+
+    <x-toast :message="session('success')" fresh />
+    <x-error-toast :messages="session('error')" fresh />
+
+    @if (
+        $selectedRequestId !== null
+        && $selectedInspectionRequest !== null
+    )
+        <flux:card>
+            <div class="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                <div>
+                    <div class="flex flex-wrap items-center gap-2">
+                        <h2 class="text-lg font-semibold">
+                            Inspection Request #{{ $selectedInspectionRequest->facility_inspection_request_id }}
+                        </h2>
+
+                        <flux:badge
+                            color="{{ $this->requestStatusColor((string) $selectedInspectionRequest->status) }}"
+                            size="sm"
+                        >
+                            {{ $selectedInspectionRequest->status }}
+                        </flux:badge>
+
+                        @if ($selectedInspection !== null)
+                            <flux:badge
+                                color="{{ $this->inspectionStatusColor((string) $selectedInspection->inspection_status) }}"
+                                size="sm"
+                            >
+                                {{ $selectedInspection->inspection_status }}
+                            </flux:badge>
+                        @endif
+                    </div>
+
+                    <p class="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
+                        {{ $selectedLabel }}
+                    </p>
+
+                    <dl class="mt-3 grid gap-3 text-sm sm:grid-cols-2 xl:grid-cols-4">
+                        <div>
+                            <dt class="text-zinc-500">Requested by</dt>
+                            <dd class="font-medium">
+                                {{ $this->staffName($selectedInspectionRequest->requestedBy, 'Unknown cashier') }}
+                            </dd>
+                        </div>
+
+                        <div>
+                            <dt class="text-zinc-500">Assigned to</dt>
+                            <dd class="font-medium">
+                                {{ $this->staffName($selectedInspectionRequest->assignedTo) }}
+                            </dd>
+                        </div>
+
+                        <div>
+                            <dt class="text-zinc-500">Requested</dt>
+                            <dd class="font-medium">
+                                {{ $selectedInspectionRequest->requested_at?->format('M d, Y h:i A') ?? 'N/A' }}
+                            </dd>
+                        </div>
+
+                        <div>
+                            <dt class="text-zinc-500">Completed</dt>
+                            <dd class="font-medium">
+                                {{ $selectedInspectionRequest->completed_at?->format('M d, Y h:i A') ?? 'Not completed' }}
+                            </dd>
+                        </div>
+                    </dl>
+
+                    @if (filled($selectedInspectionRequest->request_notes))
+                        <p class="mt-3 rounded-lg bg-zinc-50 px-3 py-2 text-sm text-zinc-600 dark:bg-zinc-900 dark:text-zinc-300">
+                            Cashier note: {{ $selectedInspectionRequest->request_notes }}
+                        </p>
+                    @endif
+                </div>
+
+                <div class="flex flex-wrap gap-2">
+                    <flux:button
+                        variant="ghost"
+                        wire:click="cancelSelection"
+                    >
+                        Close
+                    </flux:button>
+                </div>
+            </div>
+
+            <div class="mt-5 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+                <h3 class="text-sm font-semibold">
+                    Checklist items
+                </h3>
+
+                <p class="mt-1 text-xs text-zinc-500">
+                    Includes inclusive facility amenities and delivered amenity requests assigned to this facility.
+                </p>
+
+                <div class="mt-3 overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
+                    <table class="min-w-full divide-y divide-zinc-200 text-sm dark:divide-zinc-800">
+                        <thead class="bg-zinc-50 dark:bg-zinc-900">
+                            <tr>
+                                <th class="px-3 py-2 text-left">Item</th>
+                                <th class="px-3 py-2 text-left">Source</th>
+                                <th class="px-3 py-2 text-left">Expected Qty</th>
+                                <th class="px-3 py-2 text-left">Fine setup</th>
+                            </tr>
+                        </thead>
+
+                        <tbody class="divide-y divide-zinc-200 dark:divide-zinc-800">
+                            @forelse ($selectedChecklistItems as $item)
+                                <tr>
+                                    <td class="px-3 py-2 font-medium">
+                                        {{ $item['amenity_name'] }}
+                                    </td>
+
+                                    <td class="px-3 py-2">
+                                        {{ $item['source_label'] }}
+                                    </td>
+
+                                    <td class="px-3 py-2">
+                                        {{ $item['expected_quantity'] }}
+                                    </td>
+
+                                    <td class="px-3 py-2">
+                                        @if ($item['fine_count'] > 0)
+                                            <span class="text-green-700 dark:text-green-300">
+                                                {{ $item['fine_count'] }} fine option(s)
+                                            </span>
+                                        @else
+                                            <span class="text-amber-700 dark:text-amber-300">
+                                                No amenity fine configured
+                                            </span>
+                                        @endif
+                                    </td>
+                                </tr>
+                            @empty
+                                <tr>
+                                    <td colspan="4" class="px-3 py-5 text-center text-zinc-500">
+                                        No checklist items are configured for this facility.
+                                    </td>
+                                </tr>
+                            @endforelse
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            @if (
+                $this->canMarkNoDamage()
+                || $this->canRecordFine()
+            )
+                <div class="mt-5">
+                    <flux:textarea
+                        label="Inspection remarks"
+                        wire:model="remarks"
+                        rows="3"
+                        placeholder="Optional notes: all items complete, towel missing, stained blanket..."
+                    />
+                </div>
+            @endif
+
+            @if ($this->canRecordFine())
+                <div class="mt-5 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+                    <h3 class="font-semibold">
+                        Record damage, missing item, or situational fine
+                    </h3>
+
+                    <div class="mt-4 grid gap-3 lg:grid-cols-4 lg:items-end">
+                        <flux:field class="relative">
+                            <flux:label>Checklist item</flux:label>
+                            <flux:select wire:model.live="selectedChecklistKey">
+                                <option value="">
+                                    No specific item / situational fine
+                                </option>
+
+                                @foreach ($selectedChecklistItems as $item)
+                                    <option value="{{ $item['key'] }}">
+                                        {{ $item['amenity_name'] }}
+                                        — {{ $item['source_label'] }}
+                                    </option>
+                                @endforeach
+                            </flux:select>
+                        </flux:field>
+
+                        <flux:field class="relative">
+                            <flux:label>Fine <span class="text-red-500">*</span></flux:label>
+                            <flux:select wire:model="fineId" :invalid="$errors->has('fineId')">
+                            <option value="">Select fine</option>
+
+                            @foreach ($fines as $fine)
+                                <option value="{{ $fine->fine_id }}">
+                                    {{ $this->formatFineLabel($fine) }}
+                                </option>
+                            @endforeach
+                        </flux:select>
+                            @if ($msg = $this->visibleError('fineId'))
+                                <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $msg }}</p>
+                            @endif
+                        </flux:field>
+
+                        @php($quantityLimit = $this->fineQuantityLimit($selectedChecklistItems))
+                        <flux:field class="relative">
+                            <flux:label>Quantity <span class="text-red-500">*</span></flux:label>
+
+                            @if ($quantityLocked)
+                                {{-- Situational fine: not tied to a checklist item, always charged as 1 --}}
+                                <div wire:key="fine-quantity-locked" class="flex items-center gap-2">
+                                    <flux:button type="button" icon="minus" aria-label="Decrease quantity" disabled />
+
+                                    <div class="min-w-0 flex-1">
+                                        <flux:input
+                                            type="text"
+                                            value="1"
+                                            class="text-center"
+                                            aria-label="Quantity (locked at 1)"
+                                            disabled
+                                        />
+                                    </div>
+
+                                    <flux:button type="button" icon="plus" aria-label="Increase quantity" disabled />
+                                </div>
+
+                    
+                            @else
+                            {{-- Whole numbers only: 1 up to what the selected item has in the facility / was delivered --}}
+                            <div
+                                wire:key="fine-quantity-editable"
+                                class="flex items-center gap-2"
+                                data-max="{{ $quantityLimit }}"
+                                x-data="{
+                                    qty: $wire.$entangle('fineQuantity'),
+                                    get max() { return parseInt($root.dataset.max) || 1 },
+                                    set(value) {
+                                        value = parseInt(value)
+                                        this.qty = Math.min(this.max, Math.max(1, isNaN(value) ? 1 : value))
+                                    },
+                                }"
+                            >
+                                <flux:button
+                                    type="button"
+                                    icon="minus"
+                                    aria-label="Decrease quantity"
+                                    x-on:click="set(qty - 1)"
+                                    x-bind:disabled="qty <= 1"
+                                />
+
+                                <div class="min-w-0 flex-1">
+                                    <flux:input
+                                        type="text"
+                                        inputmode="numeric"
+                                        pattern="[0-9]*"
+                                        class="text-center"
+                                        :invalid="$errors->has('fineQuantity')"
+                                        x-bind:value="qty"
+                                        x-on:input="$event.target.value = $event.target.value.replace(/\D/g, '')"
+                                        x-on:change="set($event.target.value)"
+                                        x-on:blur="set($event.target.value)"
+                                    />
+                                </div>
+
+                                <flux:button
+                                    type="button"
+                                    icon="plus"
+                                    aria-label="Increase quantity"
+                                    x-on:click="set(qty + 1)"
+                                    x-bind:disabled="qty >= max"
+                                />
+                            </div>
+
+    
+                            @endif
+                            @if ($msg = $this->visibleError('fineQuantity'))
+                                <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $msg }}</p>
+                            @endif
+                        </flux:field>
+
+                        <flux:button
+                            variant="primary"
+                            wire:click="addFine"
+                        >
+                            Record Fine
+                        </flux:button>
+                    </div>
+
+                    @if ($fines->isEmpty())
+                        <div class="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">
+                            @if ($selectedChecklistKey !== '')
+                                Admin must configure an amenity fine for this checklist item before it can be charged.
+                            @else
+                                Admin must configure a situational fine before one can be recorded.
+                            @endif
+                        </div>
+                    @endif
+                </div>
+            @endif
+
+            @if ($this->canMarkNoDamage())
+                <div class="mt-5 flex flex-col gap-2 rounded-lg border border-green-200 bg-green-50 p-4 sm:flex-row sm:items-center sm:justify-between dark:border-green-900 dark:bg-green-950/30">
+                    <div>
+                        <p class="font-medium text-green-900 dark:text-green-100">
+                            No damage or missing items found
+                        </p>
+
+                        <p class="text-xs text-green-700 dark:text-green-300">
+                            @if ($selectedDraftFines->contains('status', 'Draft'))
+                                Unavailable while draft fines exist. Remove them, or use Complete Inspection to post them.
+                            @else
+                                Use this only after checking all inclusive and delivered requested amenities.
+                            @endif
+                        </p>
+                    </div>
+
+                    <flux:button
+                        wire:click="requestCompletion('no_damage')"
+                        variant="primary"
+                        :disabled="$selectedDraftFines->contains('status', 'Draft')"
+                    >
+                        Complete as No Damage
+                    </flux:button>
+                </div>
+            @elseif (
+                ! $this->canRecordFine()
+                && $selectedInspectionRequest->status === 'Completed'
+            )
+                <div class="mt-5 rounded-lg border border-zinc-200 bg-zinc-50 px-4 py-3 text-sm text-zinc-600 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300">
+                    This completed inspection is read-only for the current user.
+                </div>
+            @elseif (
+                (int) $selectedInspectionRequest->assigned_to_user_id
+                    !== (int) Auth::id()
+            )
+                <div class="mt-5 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">
+                    This request is assigned to another maintenance staff member.
+                </div>
+            @endif
+
+            <div class="mt-5 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+                <div class="flex items-center justify-between gap-3">
+                    <h3 class="font-semibold">Damage photos</h3>
+                    <span class="text-xs text-zinc-500">
+                        {{ $inspectionPhotos->count() }} / {{ \App\Services\FacilityInspectionPhotoService::MAX_PHOTOS }}
+                    </span>
+                </div>
+
+                @if ($this->canRecordFine())
+                    @if ($inspectionPhotos->count() < \App\Services\FacilityInspectionPhotoService::MAX_PHOTOS)
+                        <div class="mt-3">
+                            <input
+                                type="file"
+                                accept="image/jpeg,image/png,image/webp"
+                                wire:model="photo" x-data x-on:livewire-upload-finish="$el.value = ''"
+                                class="block w-full text-sm text-zinc-600 file:mr-3 file:rounded-lg file:border-0 file:bg-zinc-100 file:px-3 file:py-2 file:text-sm file:font-medium dark:text-zinc-300 dark:file:bg-zinc-800"
+                            />
+                            <p class="mt-1 text-xs text-zinc-500">
+                                JPG, PNG or WebP · one photo at a time · up to 64 MB each · up to {{ \App\Services\FacilityInspectionPhotoService::MAX_PHOTOS }} photos per inspection.
+                            </p>
+                            <p wire:loading wire:target="photo" class="mt-1 text-xs font-medium text-blue-600 dark:text-blue-400">Uploading…</p>
+                        </div>
+                    @else
+                        <p class="mt-3 text-xs text-amber-700 dark:text-amber-300">Photo limit reached. Remove a photo to add another.</p>
+                    @endif
+
+                    @error('photos') <p class="mt-2 text-sm font-medium text-red-500 dark:text-red-400">{{ $message }}</p> @enderror
+                    @error('photos.*') <p class="mt-2 text-sm font-medium text-red-500 dark:text-red-400">{{ $message }}</p> @enderror
+                @endif
+
+                @if ($inspectionPhotos->isNotEmpty())
+                    <div class="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+                        @foreach ($inspectionPhotos as $photo)
+                            <div wire:key="inspection-photo-{{ $photo->facility_inspection_photo_id }}" class="group relative overflow-hidden rounded-lg border border-zinc-200 dark:border-zinc-700">
+                                <a href="{{ route('facility-inspection-photos.show', $photo) }}" target="_blank" rel="noopener">
+                                    <img
+                                        src="{{ route('facility-inspection-photos.show', [$photo, 'size' => 'thumb']) }}"
+                                        alt="{{ $photo->original_name ?? 'Damage photo' }}"
+                                        loading="lazy"
+                                        class="aspect-square w-full object-cover"
+                                    />
+                                </a>
+                                <p class="px-2 py-1 text-[11px] text-zinc-500 dark:text-zinc-400">{{ $photo->created_at?->format('M d, Y · h:i A') }}@if ($photo->uploadedBy)<br>by {{ $photo->uploadedBy->full_name }}@endif</p>
+                                @if ($this->canRecordFine())
+                                    <button
+                                        type="button"
+                                        wire:click="deletePhoto({{ $photo->facility_inspection_photo_id }})"
+                                        wire:confirm="Remove this photo?"
+                                        class="absolute right-1 top-1 rounded-full bg-black/60 px-2 py-0.5 text-xs font-medium text-white hover:bg-red-600"
+                                        aria-label="Remove photo"
+                                    >
+                                        Remove
+                                    </button>
+                                @endif
+                            </div>
+                        @endforeach
+                    </div>
+                @else
+                    <p class="mt-3 text-sm text-zinc-500">No photos attached.</p>
+                @endif
+            </div>
+
+            @if ($selectedDraftFines->isNotEmpty())
+                <div class="mt-5 rounded-lg border border-amber-200 bg-amber-50/50 p-4 dark:border-amber-900 dark:bg-amber-950/20">
+                    <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                        <div>
+                            <h3 class="font-semibold text-amber-950 dark:text-amber-100">Draft fines</h3>
+                            <p class="text-sm text-amber-800 dark:text-amber-200">Not payable yet. Review these entries, then complete the inspection to post and lock them.</p>
+                        </div>
+                        @if ($this->canRecordFine())
+                            <flux:button wire:click="requestCompletion('publish_fines')" variant="primary">
+                                Complete Inspection
+                            </flux:button>
+                        @endif
+                    </div>
+
+                    <div class="mt-4 overflow-x-auto rounded-lg border border-amber-200 dark:border-amber-900">
+                        <table class="min-w-full divide-y divide-amber-200 text-sm dark:divide-amber-900">
+                            <thead>
+                                <tr>
+                                    <th class="px-3 py-2 text-left">Fine</th>
+                                    <th class="px-3 py-2 text-left">Qty</th>
+                                    <th class="px-3 py-2 text-left">Draft charge</th>
+                                    <th class="px-3 py-2 text-right">Action</th>
+                                </tr>
+                            </thead>
+                            <tbody class="divide-y divide-amber-200 dark:divide-amber-900">
+                                @foreach ($selectedDraftFines as $draftFine)
+                                    <tr>
+                                        <td class="px-3 py-2">{{ $this->formatFineLabel($draftFine->fine) }}</td>
+                                        <td class="px-3 py-2">{{ $draftFine->quantity }}</td>
+                                        <td class="px-3 py-2">₱{{ number_format((float) $draftFine->total_charge, 2) }}</td>
+                                        <td class="px-3 py-2 text-right">
+                                            @if ($draftFine->status === 'Draft' && $this->canRecordFine())
+                                                <flux:button type="button" size="sm" variant="ghost" icon="trash" wire:click="removeDraftFine({{ $draftFine->inspection_draft_fine_id }})">
+                                                    Remove
+                                                </flux:button>
+                                            @else
+                                                <flux:badge color="green">{{ $draftFine->status }}</flux:badge>
+                                            @endif
+                                        </td>
+                                    </tr>
+                                @endforeach
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            @endif
+
+            <div class="mt-5">
+                <h3 class="text-sm font-semibold">
+                    Posted fines for this facility
+                </h3>
+
+                <div class="mt-2 overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
+                    <table class="min-w-full divide-y divide-zinc-200 text-sm dark:divide-zinc-800">
+                        <thead class="bg-zinc-50 dark:bg-zinc-900">
+                            <tr>
+                                <th class="px-3 py-2 text-left">Fine</th>
+                                <th class="px-3 py-2 text-left">Qty</th>
+                                <th class="px-3 py-2 text-left">Charge</th>
+                                <th class="px-3 py-2 text-left">Reported by</th>
+                            </tr>
+                        </thead>
+
+                        <tbody class="divide-y divide-zinc-200 dark:divide-zinc-800">
+                            @forelse ($selectedGuestFines as $guestFine)
+                                <tr>
+                                    <td class="px-3 py-2">
+                                        {{ $this->formatFineLabel($guestFine->fine) }}
+                                    </td>
+
+                                    <td class="px-3 py-2">
+                                        {{ $guestFine->quantity }}
+                                    </td>
+
+                                    <td class="px-3 py-2">
+                                        ₱{{ number_format((float) $guestFine->total_charge, 2) }}
+                                    </td>
+
+                                    <td class="px-3 py-2">
+                                        {{ $this->staffName($guestFine->reportedBy, 'Unknown') }}
+                                    </td>
+                                </tr>
+                            @empty
+                                <tr>
+                                    <td colspan="4" class="px-3 py-5 text-center text-zinc-500">
+                                        No fines have been posted for this facility.
+                                    </td>
+                                </tr>
+                            @endforelse
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </flux:card>
+    @endif
+
+    <flux:card class="overflow-hidden p-0">
+
+
+            <div class="grid gap-3 border-b border-zinc-200 p-4 md:grid-cols-5 dark:border-zinc-800">
+                    <flux:input
+                        wire:model.live.debounce.300ms="search"
+                        label="Search"
+                        placeholder="Request, booking"
+                        clearable
+                    />
+
+                    <flux:select
+                        wire:model.live="statusFilter"
+                        label="Request status"
+                    >
+                        <option value="all">All</option>
+                        <option value="active">Pending / In Progress</option>
+                        <option value="pending">Pending only</option>
+                        <option value="in_progress">In Progress only</option>
+                        <option value="completed">Completed history</option>
+                    </flux:select>
+
+                    <flux:select
+                        wire:model.live="assignmentFilter"
+                        label="Assignment"
+                    >
+                        <option value="">All</option>
+                        <option value="unassigned">Unassigned pending</option>
+                        <option value="mine">Assigned to me</option>
+                        <option value="other">Assigned to another staff</option>
+                    </flux:select>
+
+                    <flux:select
+                        wire:model.live="dateFilter"
+                        label="Scheduled departure"
+                    >
+                        <option value="all">All </option>
+                        <option value="today">Due today</option>
+                        <option value="upcoming">Upcoming</option>
+                        <option value="overdue">Past scheduled date</option>
+                    </flux:select>
+
+                    <div class="flex items-end gap-2">
+                    <flux:select
+                        wire:model.live="perPage"
+                        label="Rows"
+                    >
+                        <option value="10">10</option>
+                        <option value="25">25</option>
+                        <option value="50">50</option>
+                        <option value="100">100</option>
+                    </flux:select>
+
+                <flux:button type="button" wire:click="clearFilters" variant="ghost">Clear Filters</flux:button>
+                </div>
+            </div>
+
+
+        <div class="overflow-x-auto" wire:loading.class="opacity-60" wire:target="search,statusFilter,assignmentFilter,dateFilter,perPage,sortBy,clearFilters">
+            <table class="w-full min-w-[94rem] text-left text-sm">
+                <thead class="border-b border-brand-border bg-zinc-50 text-xs uppercase tracking-wide text-brand-text-muted dark:border-zinc-800 dark:bg-zinc-950/60 dark:text-zinc-400">
+                    <tr>
+                        <th class="px-4 py-3">
+                            <button
+                                type="button"
+                                wire:click="sortBy('facility_inspection_request_id')"
+                                class="font-semibold transition hover:text-brand-text dark:hover:text-white"
+                            >
+                                REQUEST {{ $this->sortIndicator('facility_inspection_request_id') }}
+                            </button>
+                        </th>
+
+                        <th class="px-4 py-3">
+                            <button
+                                type="button"
+                                wire:click="sortBy('requested_at')"
+                                class="font-semibold transition hover:text-brand-text dark:hover:text-white"
+                            >
+                                REQUESTED {{ $this->sortIndicator('requested_at') }}
+                            </button>
+                        </th>
+
+                        <th class="px-4 py-3">
+                            <button
+                                type="button"
+                                wire:click="sortBy('b_ref_no')"
+                                class="font-semibold transition hover:text-brand-text dark:hover:text-white"
+                            >
+                                BOOKING {{ $this->sortIndicator('b_ref_no') }}
+                            </button>
+                        </th>
+
+                        <th class="px-4 py-3">
+                            <button
+                                type="button"
+                                wire:click="sortBy('guest_name')"
+                                class="font-semibold transition hover:text-brand-text dark:hover:text-white"
+                            >
+                                GUEST {{ $this->sortIndicator('guest_name') }}
+                            </button>
+                        </th>
+
+                        <th class="px-4 py-3">
+                            <button
+                                type="button"
+                                wire:click="sortBy('facility_name')"
+                                class="font-semibold transition hover:text-brand-text dark:hover:text-white"
+                            >
+                                FACILITY {{ $this->sortIndicator('facility_name') }}
+                            </button>
+                        </th>
+
+                        <th class="px-4 py-3">
+                            <button
+                                type="button"
+                                wire:click="sortBy('check_out_date')"
+                                class="font-semibold transition hover:text-brand-text dark:hover:text-white"
+                            >
+                                SCHEDULED DEPARTURE {{ $this->sortIndicator('check_out_date') }}
+                            </button>
+                        </th>
+
+                        <th class="px-4 py-3 font-semibold">Requested By</th>
+
+                        <th class="px-4 py-3">
+                            <button
+                                type="button"
+                                wire:click="sortBy('assigned_to')"
+                                class="font-semibold transition hover:text-brand-text dark:hover:text-white"
+                            >
+                                ASSIGNED TO {{ $this->sortIndicator('assigned_to') }}
+                            </button>
+                        </th>
+
+                        <th class="px-4 py-3">
+                            <button
+                                type="button"
+                                wire:click="sortBy('request_status')"
+                                class="font-semibold transition hover:text-brand-text dark:hover:text-white"
+                            >
+                                REQUEST STATUS {{ $this->sortIndicator('request_status') }}
+                            </button>
+                        </th>
+
+                        <th class="px-4 py-3 font-semibold">Inspection Result</th>
+                        <th class="px-4 py-3 text-right font-semibold">Actions</th>
+                    </tr>
+                </thead>
+
+                <tbody class="divide-y divide-brand-border/70 dark:divide-zinc-800">
+                    @forelse ($inspectionRequests as $request)
+                        <tr
+                            wire:key="inspection-request-{{ $request->facility_inspection_request_id }}"
+                            class="align-top text-brand-text transition-colors dark:text-zinc-200 {{ $selectedRequestId === (int) $request->facility_inspection_request_id ? 'bg-blue-50 ring-1 ring-inset ring-blue-200 dark:bg-blue-950/30 dark:ring-blue-800' : 'hover:bg-brand-surface-muted/70 dark:hover:bg-zinc-800/60' }}"
+                        >
+                            <td class="px-4 py-4 font-medium">
+                                #{{ $request->facility_inspection_request_id }}
+                            </td>
+
+                            <td class="px-4 py-4">
+                                {{ $request->requested_at?->format('M d, Y h:i A') ?? 'N/A' }}
+                            </td>
+
+                            <td class="px-4 py-4 font-medium">
+                                {{ $request->booking?->b_ref_no ?? 'Unknown' }}
+                            </td>
+
+                            <td class="px-4 py-4">
+                                <p class="font-medium">
+                                    {{ $request->booking?->guest?->full_name
+                                        ?? trim(($request->booking?->guest?->first_name ?? '').' '.($request->booking?->guest?->last_name ?? ''))
+                                        ?: 'Unknown guest' }}
+                                </p>
+
+                                <p class="mt-1 text-xs text-brand-text-muted dark:text-zinc-400">
+                                    {{ $request->booking?->guest?->contact_no ?? 'No contact' }}
+                                </p>
+                            </td>
+
+                            <td class="px-4 py-4">
+                                {{ $request->facility?->facility_name ?? 'No facility' }}
+                            </td>
+
+                            <td class="px-4 py-4">
+                                {{ $request->bookingDetail?->check_out_date?->format('M d, Y') ?? 'N/A' }}
+                            </td>
+
+                            <td class="px-4 py-4">
+                                {{ $this->staffName($request->requestedBy, 'Unknown cashier') }}
+                            </td>
+
+                            <td class="px-4 py-4">
+                                {{ $this->staffName($request->assignedTo) }}
+                            </td>
+
+                            <td class="px-4 py-4">
+                                <x-status-badge :status="(string) $request->status" />
+                            </td>
+
+                            <td class="px-4 py-4">
+                                @if ($request->inspection !== null)
+                                    <flux:badge
+                                        color="{{ $this->inspectionStatusColor((string) $request->inspection->inspection_status) }}"
+                                        size="sm"
+                                    >
+                                        {{ $request->inspection->inspection_status }}
+                                    </flux:badge>
+                                @else
+                                    <span class="text-xs text-brand-text-muted dark:text-zinc-400">
+                                        Not recorded
+                                    </span>
+                                @endif
+                            </td>
+
+                            <td class="px-4 py-4 text-right">
+                                <div class="flex flex-wrap justify-end gap-2">
+                                    @if ($request->status === 'Pending')
+                                        <flux:button
+                                            type="button"
+                                            icon="clipboard-document-check"
+                                            wire:click="selectRequest({{ $request->facility_inspection_request_id }})"
+                                            size="sm"
+                                            variant="primary"
+                                        >
+                                            Accept & Inspect
+                                        </flux:button>
+                                    @elseif (
+                                        $request->status === 'In Progress'
+                                        && (int) $request->assigned_to_user_id
+                                            === (int) Auth::id()
+                                    )
+                                        <flux:button
+                                            type="button"
+                                            icon="arrow-path"
+                                            wire:click="selectRequest({{ $request->facility_inspection_request_id }})"
+                                            size="sm"
+                                            variant="primary"
+                                        >
+                                            Continue
+                                        </flux:button>
+                                    @elseif ($request->status === 'In Progress')
+                                        <span class="self-center text-xs text-brand-text-muted dark:text-zinc-400">
+                                            Assigned to another staff
+                                        </span>
+                                    @else
+                                        <flux:button
+                                            type="button"
+                                            icon="eye"
+                                            wire:click="selectRequest({{ $request->facility_inspection_request_id }})"
+                                            size="sm"
+                                            variant="ghost"
+                                        >
+                                            View
+                                        </flux:button>
+                                    @endif
+                                </div>
+                            </td>
+                        </tr>
+                    @empty
+                        <tr>
+                            <td colspan="11" class="px-5 py-6">
+                                <x-dashboard-empty-state
+                                    title="No inspection requests found"
+                                    description="No inspection request matches the selected search, status, assignment, and departure filters."
+                                    class="border-0 bg-transparent py-6 shadow-none dark:bg-transparent"
+                                />
+                            </td>
+                        </tr>
+                    @endforelse
+                </tbody>
+            </table>
+
+
+        </div>
+
+        <div class="border-t border-zinc-200 px-5 py-4 dark:border-zinc-800">
+            {{ $inspectionRequests->links() }}
+        </div>
+    </flux:card>
+    <flux:modal wire:model="showCompletionDialog" class="md:w-[32rem]">
+        <div class="space-y-5">
+            <div>
+                <flux:heading size="lg">
+                    {{ $pendingCompletion === 'publish_fines' ? 'Complete inspection and publish fines?' : 'Complete inspection with no damage?' }}
+                </flux:heading>
+                <flux:text class="mt-1">
+                    @if ($pendingCompletion === 'publish_fines')
+                        All current draft fines will become payable, the booking balance will be updated atomically, and the inspection will be locked against ordinary edits.
+                    @else
+                        The inspection will be completed and locked with no payable damage findings.
+                    @endif
+                </flux:text>
+            </div>
+            <div class="flex justify-end gap-3">
+                <flux:button type="button" variant="ghost" wire:click="$set('showCompletionDialog', false)">Cancel</flux:button>
+                <flux:button type="button" variant="primary" wire:click="confirmCompletion">
+                    Complete Inspection
+                </flux:button>
+            </div>
+        </div>
+    </flux:modal>
+
+</div>

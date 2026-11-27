@@ -1,0 +1,713 @@
+<?php
+
+use App\Models\Amenity;
+use App\Models\AmenityName;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Pagination\LengthAwarePaginator;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\Rule;
+use Livewire\Attributes\Computed;
+use Livewire\Attributes\Layout;
+use Livewire\Attributes\Title;
+use Livewire\Attributes\Url;
+use Livewire\Volt\Component;
+use Livewire\WithPagination;
+
+new #[Layout('layouts.app')] #[Title('Amenity Management - Olaer Spring Resort')] class extends Component
+{
+
+    public function updated(string $property): void
+    {
+        // Clear the red highlight of a field as soon as the user edits it.
+        $this->resetValidation($property);
+    }
+
+    /** Error text for a required field; an empty required field only turns red (no text). */
+    public function visibleError(string $field): ?string
+    {
+        $message = $this->getErrorBag()->first($field);
+
+        if ($message === '') {
+            return null;
+        }
+
+        $value = data_get($this, $field);
+
+        return $value === null || $value === '' || $value === [] ? null : $message;
+    }
+    use WithPagination;
+
+    #[Url(as: 'q', except: '')]
+    public string $search = '';
+
+    #[Url(as: 'type', except: '')]
+    public string $typeFilter = '';
+
+    #[Url(as: 'sort', except: 'amenity_name')]
+    public string $sortField = 'amenity_name';
+
+    #[Url(as: 'direction', except: 'asc')]
+    public string $sortDirection = 'asc';
+
+    #[Url(as: 'per_page', except: 10)]
+    public int $perPage = 10;
+
+    public ?int $editingId = null;
+    public bool $showEditor = false;
+    public string $amenityName = '';
+    public string $amenityDescription = '';
+    public string $amenityType = 'Rentable';
+    public string $amenityPrice = '';
+    public string $requestLimitCottage = '10';
+    public string $requestLimitRoom = '10';
+    public string $requestLimitFunctionHall = '10';
+
+    #[Computed]
+    public function amenities(): LengthAwarePaginator
+    {
+        $allowedSorts = [
+            'amenity_name',
+            'amenity_description',
+            'amenity_type',
+            'amenity_price',
+        ];
+
+        $sortField = in_array($this->sortField, $allowedSorts, true)
+            ? $this->sortField
+            : 'amenity_name';
+
+        $direction = $this->sortDirection === 'desc' ? 'desc' : 'asc';
+
+        $perPage = in_array($this->perPage, [10, 25, 50, 100], true)
+            ? $this->perPage
+            : 10;
+
+        $query = Amenity::query()
+            ->with('amenityName')
+            ->withCount([
+                'facilityAmenities',
+                'amenityRequestDetails',
+                'fines',
+            ])
+            ->when(trim($this->search) !== '', function (Builder $query): void {
+                $like = '%'.trim($this->search).'%';
+
+                $query->where(function (Builder $query) use ($like): void {
+                    $query->where('amenity_description', 'like', $like)
+                        ->orWhere('amenity_type', 'like', $like)
+                        ->orWhere('amenity_price', 'like', $like)
+                        ->orWhereHas('amenityName', function (Builder $query) use ($like): void {
+                            $query->where('amenity_name', 'like', $like);
+                        });
+                });
+            })
+            ->when(
+                $this->typeFilter !== '',
+                fn (Builder $query) => $query->where(
+                    'amenity_type',
+                    $this->typeFilter,
+                ),
+            );
+
+        match ($sortField) {
+            'amenity_description' => $query->orderBy(
+                'amenity_description',
+                $direction,
+            ),
+            'amenity_type' => $query
+                ->orderBy('amenity_type', $direction)
+                ->orderBy('amenity_description'),
+            'amenity_price' => $query->orderBy(
+                'amenity_price',
+                $direction,
+            ), 
+            default => $query->orderBy(
+                AmenityName::query()
+                    ->select('amenity_name')
+                    ->whereColumn(
+                        'tbl_amenity_name.amenity_name_id',
+                        'tbl_amenity.amenity_name_id',
+                    ),
+                $direction,
+            ),
+        };
+
+        return $query
+            ->orderBy('amenity_id')
+            ->paginate($perPage);
+    }
+
+    public function updatedSearch(): void
+    {
+        $this->resetPage();
+    }
+
+    public function updatedTypeFilter(): void
+    {
+        $this->resetPage();
+    }
+
+    public function updatedPerPage(): void
+    {
+        if (! in_array($this->perPage, [10, 25, 50, 100], true)) {
+            $this->perPage = 10;
+        }
+
+        $this->resetPage();
+    }
+
+    public function updatedAmenityType(string $type): void
+    {
+        if ($type === 'Inclusive') {
+            $this->amenityPrice = '0.00';
+        }
+    }
+
+    public function clearFilters(): void
+    {
+        $this->search = '';
+        $this->typeFilter = '';
+        $this->sortField = 'amenity_name';
+        $this->sortDirection = 'asc';
+        $this->perPage = 10;
+
+        $this->resetPage();
+    }
+
+    public function sortBy(string $field): void
+    {
+        $allowedSorts = [
+            'amenity_name',
+            'amenity_description',
+            'amenity_type',
+            'amenity_price',
+        ];
+
+        if (! in_array($field, $allowedSorts, true)) {
+            return;
+        }
+
+        if ($this->sortField === $field) {
+            $this->sortDirection = $this->sortDirection === 'asc'
+                ? 'desc'
+                : 'asc';
+        } else {
+            $this->sortField = $field;
+            $this->sortDirection = 'asc';
+        }
+
+        $this->resetPage();
+    }
+
+    public function createNew(): void
+    {
+        $this->resetForm();
+        $this->showEditor = true;
+    }
+
+    public function startEditing(int $amenityId): void
+    {
+        $amenity = Amenity::query()
+            ->with('amenityName')
+            ->findOrFail($amenityId);
+
+        $this->editingId = (int) $amenity->amenity_id;
+        $this->amenityName = (string) (
+            $amenity->amenityName?->amenity_name
+            ?? ''
+        );
+        $this->amenityDescription = (string) $amenity->amenity_description;
+        $this->amenityType = (string) $amenity->amenity_type;
+        $this->amenityPrice = number_format(
+            (float) $amenity->amenity_price,
+            2,
+            '.',
+            '',
+        );
+
+        $this->requestLimitCottage = (string) $amenity->requestLimitFor('Cottage');
+        $this->requestLimitRoom = (string) $amenity->requestLimitFor('Room');
+        $this->requestLimitFunctionHall = (string) $amenity->requestLimitFor('Function Hall');
+
+        $this->resetValidation();
+        $this->showEditor = true;
+    }
+
+    public function cancelEdit(): void
+    {
+        session()->flash('success', 'Amenity edit cancelled. No changes were saved.');
+        $this->showEditor = false;
+        $this->resetForm();
+    }
+
+    public function resetForm(): void
+    {
+        $this->editingId = null;
+        $this->amenityName = '';
+        $this->amenityDescription = '';
+        $this->amenityType = 'Rentable';
+        $this->amenityPrice = '';
+        $this->requestLimitCottage = '10';
+        $this->requestLimitRoom = '10';
+        $this->requestLimitFunctionHall = '10';
+
+        $this->resetValidation();
+    }
+
+    public function save(): void
+    {
+        $limitRules = [];
+        $limitMessages = [];
+
+        foreach ([
+            'requestLimitCottage' => 'Cottage',
+            'requestLimitRoom' => 'Room',
+            'requestLimitFunctionHall' => 'Function Hall',
+        ] as $field => $label) {
+            $limitRules[$field] = ['required', 'integer', 'min:1', 'max:1000'];
+            $limitMessages["{$field}.required"] = "Enter how many units can be requested per {$label} facility.";
+            $limitMessages["{$field}.integer"] = "The {$label} limit must be a whole number.";
+            $limitMessages["{$field}.min"] = "The {$label} limit must be at least 1.";
+            $limitMessages["{$field}.max"] = "The {$label} limit cannot be more than 1000.";
+        }
+
+        $validated = $this->validate([
+            'editingId' => [
+                'nullable',
+                'integer',
+                'exists:tbl_amenity,amenity_id',
+            ],
+            'amenityName' => ['required', 'string', 'max:50'],
+            'amenityDescription' => ['required', 'string', 'max:50'],
+            'amenityType' => [
+                'required',
+                Rule::in(['Rentable', 'Inclusive']),
+            ],
+            'amenityPrice' => [
+                'nullable',
+                'numeric',
+                'min:0',
+                'max:999999.99',
+            ],
+            ...$limitRules,
+        ], [
+            ...$limitMessages,
+            'amenityName.required' => 'Amenity name is required.',
+            'amenityName.max' => 'Amenity name must not exceed 50 characters.',
+            'amenityDescription.required' => 'Amenity description is required.',
+            'amenityDescription.max' => 'Amenity description must not exceed 50 characters.',
+            'amenityType.in' => 'Amenity type must be Rentable or Inclusive.',
+            'amenityPrice.numeric' => 'Amenity price must be a valid amount.',
+        ]);
+
+        $name = trim(
+            preg_replace('/\s+/', ' ', $validated['amenityName'])
+        );
+
+        $description = trim(
+            preg_replace('/\s+/', ' ', $validated['amenityDescription'])
+        );
+
+        $type = $validated['amenityType'];
+
+        $price = $type === 'Inclusive'
+            ? 0.00
+            : round((float) ($validated['amenityPrice'] ?? 0), 2);
+
+        if ($type === 'Rentable' && $price <= 0) {
+            $this->addError(
+                'amenityPrice',
+                'Rentable amenities must have a price greater than zero because they are billed to guests.',
+            );
+
+            return;
+        }
+
+        $limitCottage = (int) $validated['requestLimitCottage'];
+        $limitRoom = (int) $validated['requestLimitRoom'];
+        $limitFunctionHall = (int) $validated['requestLimitFunctionHall'];
+
+        DB::transaction(function () use (
+            $name,
+            $description,
+            $type,
+            $price,
+            $limitCottage,
+            $limitRoom,
+            $limitFunctionHall,
+        ): void {
+            $amenityName = AmenityName::query()
+                ->whereRaw(
+                    'LOWER(amenity_name) = ?',
+                    [mb_strtolower($name)],
+                )
+                ->first();
+
+            if ($amenityName === null) {
+                $amenityName = AmenityName::query()->create([
+                    'amenity_name' => $name,
+                ]);
+            }
+
+            $duplicate = Amenity::query()
+                ->where(
+                    'amenity_name_id',
+                    $amenityName->amenity_name_id,
+                )
+                ->where('amenity_description', $description)
+                ->where('amenity_type', $type)
+                ->when(
+                    $this->editingId !== null,
+                    fn (Builder $query) => $query->where(
+                        'amenity_id',
+                        '!=',
+                        $this->editingId,
+                    ),
+                )
+                ->exists();
+
+            if ($duplicate) {
+                throw \Illuminate\Validation\ValidationException::withMessages([
+                    'amenityName' => 'This amenity already exists with the same name, description, and type.',
+                ]);
+            }
+
+            $payload = [
+                'amenity_name_id' => (int) $amenityName->amenity_name_id,
+                'amenity_description' => $description,
+                'amenity_type' => $type,
+                'amenity_price' => $price,
+                'request_limit' => max($limitCottage, $limitRoom, $limitFunctionHall),
+                'request_limit_cottage' => $limitCottage,
+                'request_limit_room' => $limitRoom,
+                'request_limit_function_hall' => $limitFunctionHall,
+            ];
+
+            if ($this->editingId !== null) {
+                Amenity::query()
+                    ->findOrFail($this->editingId)
+                    ->update($payload);
+            } else {
+                Amenity::query()->create($payload);
+            }
+        });
+
+        session()->flash(
+            'success',
+            $this->editingId !== null
+                ? 'Amenity updated successfully.'
+                : 'Amenity created successfully.',
+        );
+
+        $this->resetForm();
+        $this->showEditor = false;
+    }
+
+    public function sortIcon(string $field): string
+    {
+        if ($this->sortField !== $field) {
+            return '↕';
+        }
+
+        return $this->sortDirection === 'asc' ? '↑' : '↓';
+    }
+
+    public function typeColor(string $type): string
+    {
+        return match ($type) {
+            'Rentable' => 'blue',
+            'Inclusive' => 'green',
+            default => 'zinc',
+        };
+    }
+
+    public function usageCount(Amenity $amenity): int
+    {
+        return (int) $amenity->facility_amenities_count
+            + (int) $amenity->amenity_request_details_count
+            + (int) $amenity->fines_count;
+    }
+
+    public function usageSummary(Amenity $amenity): string
+    {
+        $parts = [];
+
+        if ((int) $amenity->facility_amenities_count > 0) {
+            $count = (int) $amenity->facility_amenities_count;
+            $parts[] = $count.' facility link'.($count === 1 ? '' : 's');
+        }
+
+        if ((int) $amenity->amenity_request_details_count > 0) {
+            $count = (int) $amenity->amenity_request_details_count;
+            $parts[] = $count.' request detail'.($count === 1 ? '' : 's');
+        }
+
+        if ((int) $amenity->fines_count > 0) {
+            $count = (int) $amenity->fines_count;
+            $parts[] = $count.' fine link'.($count === 1 ? '' : 's');
+        }
+
+        return $parts === []
+            ? 'Not linked yet'
+            : implode(', ', $parts);
+    }
+};
+
+?>
+
+<div class="space-y-6">
+    <div class="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+        <div>
+            <h1 class="text-2xl font-bold tracking-tight">
+                Amenity Management
+            </h1>
+
+            <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
+                Manage rentable and inclusive amenities, including pricing and availability.
+            </p>
+        </div>
+        <div class="flex gap-2">
+        <flux:button type="button" wire:click="createNew" variant="primary" >Create Amenity</flux:button>
+        @if (Route::has('admin.dashboard'))
+            <flux:button
+                href="{{ route('admin.dashboard') }}"
+                wire:navigate
+                variant="ghost"
+            >
+                Back to Dashboard
+            </flux:button>
+        @endif
+        </div>
+
+    </div>
+
+    <x-toast :message="session('success')" fresh />
+
+
+    <div>
+        <section class="min-w-0">
+            <flux:card class="overflow-hidden p-0">
+
+                    <div class="grid gap-3 border-b border-zinc-200 p-5 md:grid-cols-3 dark:border-zinc-800 ">
+                        <flux:input
+                            wire:model.live.debounce.300ms="search"
+                            label="Search"
+                            placeholder="Name, description, type, or price"
+                            clearable
+                        />
+
+                        <flux:select wire:model.live="typeFilter" label="Type">
+                            <option value="">All types</option>
+                            <option value="Rentable">Rentable</option>
+                            <option value="Inclusive">Inclusive</option>
+                        </flux:select>
+
+                        <div class="flex items-end gap-2">
+                        <flux:select wire:model.live="perPage" label="Rows">
+                            <option value="10">10</option>
+                            <option value="25">25</option>
+                            <option value="50">50</option>
+                            <option value="100">100</option>
+                        </flux:select>
+
+                        <div class="flex items-end">
+                            <flux:button
+                                wire:click="clearFilters"
+                                variant="ghost"
+                                class="w-full"
+                            >
+                                Clear Filters
+                            </flux:button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="overflow-x-auto">
+                    <table class="w-full min-w-[68rem] text-left text-sm">
+                        <thead class="border-b border-zinc-200 bg-zinc-50 text-xs uppercase tracking-wide text-zinc-500 dark:border-zinc-800 dark:bg-zinc-900/50">
+                            <tr>
+                                <th class="px-5 py-3 text-left"><button type="button" wire:click="sortBy('amenity_name')">NAME {{ $this->sortIcon('amenity_name') }}</button></th>
+                                <th class="px-5 py-3 text-left"><button type="button" wire:click="sortBy('amenity_description')">DESCRIPTION{{ $this->sortIcon('amenity_description') }}</button></th>
+                                <th class="px-5 py-3 text-left"><button type="button" wire:click="sortBy('amenity_type')">AMENITY TYPE{{ $this->sortIcon('amenity_type') }}</button></th>
+                                <th class="px-5 py-3 text-left"><button type="button" wire:click="sortBy('amenity_price')">PRICE{{ $this->sortIcon('amenity_price') }}</button></th>
+                                <th class="px-5 py-3 text-left">REQUEST LIMIT</th>
+                                <th class="px-5 py-3 text-right">Action</th>
+                            </tr>
+                        </thead>
+
+                        <tbody class="divide-y divide-zinc-100 dark:divide-zinc-800">
+                            @forelse ($this->amenities as $amenity)
+                                <tr wire:key="amenity-row-{{ $amenity->amenity_id }}" class="{{ $editingId === (int) $amenity->amenity_id ? 'bg-blue-50 ring-1 ring-inset ring-blue-200 dark:bg-blue-950/30 dark:ring-blue-800' : ''}} hover:bg-brand-surface-muted/70 dark:hover:bg-zinc-800/50">
+                                    <td class="px-5 py-4 font-medium">
+                                        {{ $amenity->amenityName?->amenity_name ?? 'Unnamed amenity' }}
+                                    </td>
+
+                                    <td class="px-5 py-4">
+                                        {{ $amenity->amenity_description }}
+                                    </td>
+
+                                    <td class="px-5 py-4">
+                                        <flux:badge
+                                            color="{{ $this->typeColor((string) $amenity->amenity_type) }}"
+                                            size="sm"
+                                        >
+                                            {{ $amenity->amenity_type }}
+                                        </flux:badge>
+                                    </td>
+
+                                    <td class="px-5 py-4 font-medium">
+                                        ₱{{ number_format((float) $amenity->amenity_price, 2) }}
+                                    </td>
+
+                                    <td class="px-5 py-4">
+                                        @if ($amenity->amenity_type === 'Rentable')
+                                            <div>Cottage: {{ $amenity->requestLimitFor('Cottage') }}</div>
+                                            <div>Room: {{ $amenity->requestLimitFor('Room') }}</div>
+                                            <div>Function Hall: {{ $amenity->requestLimitFor('Function Hall') }}</div>
+                                        @else
+                                            —
+                                        @endif
+                                    </td>
+
+                                    <td class="px-5 py-4 text-right">
+                                        <flux:button
+                                            type="button"
+                                            wire:click="startEditing({{ $amenity->amenity_id }})"
+                                            icon="pencil-square"
+                                            size="sm"
+                                            variant="ghost"
+                                        >
+                                            Edit
+                                        </flux:button>
+                                    </td>
+                                </tr>
+                            @empty
+                                <tr>
+                                    <td colspan="6" class="px-5 py-12 text-center text-zinc-500">
+                                        No amenity matches the selected filters.
+                                    </td>
+                                </tr>
+                            @endforelse
+                        </tbody>
+                    </table>
+                </div>
+
+                <div class="flex flex-col gap-3 border-t border-zinc-200 px-5 py-4 sm:flex-row sm:items-center sm:justify-between dark:border-zinc-800">
+                    <p class="text-sm text-zinc-500">
+                        Showing
+                        {{ $this->amenities->firstItem() ?? 0 }}
+                        to
+                        {{ $this->amenities->lastItem() ?? 0 }}
+                        of
+                        {{ $this->amenities->total() }}
+                        amenities
+                    </p>
+                    <div class="[&_p]:hidden">
+                    {{ $this->amenities->links() }}
+                    </div>
+                </div>
+            </flux:card>
+        </section>
+
+        <flux:modal wire:model="showEditor" class="md:w-[38rem] max-h-[90vh] overflow-y-auto">
+                <div class="flex items-start justify-between gap-4">
+                    <div>
+                        <h2 class="font-semibold">
+                            {{ $editingId !== null
+                                ? 'Edit amenity'
+                                : 'Create amenity' }}
+                        </h2>
+
+                        <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
+                            Labels appear in facilities, amenity requests, fines, inspections, and reports.
+                        </p>
+                    </div>
+
+                </div>
+
+                <form wire:submit="save" novalidate class="mt-5 space-y-4">
+                    <flux:field class="relative">
+                        <flux:label>Amenity name <span class="text-red-500">*</span></flux:label>
+                        <flux:input wire:model="amenityName" placeholder="Example: Chair, Pillow, Table Set" :invalid="$errors->has('amenityName')" />
+                        @if ($msg = $this->visibleError('amenityName'))
+                            <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $msg }}</p>
+                        @endif
+                    </flux:field>
+
+                    <flux:field class="relative">
+                        <flux:label>Description <span class="text-red-500">*</span></flux:label>
+                        <flux:input wire:model="amenityDescription" placeholder="Example: Monoblock, Room inclusive item" :invalid="$errors->has('amenityDescription')" />
+                        @if ($msg = $this->visibleError('amenityDescription'))
+                            <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $msg }}</p>
+                        @endif
+                    </flux:field>
+
+                    <flux:field class="relative">
+                        <flux:label>Amenity type <span class="text-red-500">*</span></flux:label>
+                        <flux:select wire:model.live="amenityType" :invalid="$errors->has('amenityType')">
+                        <option value="Rentable">Rentable</option>
+                        <option value="Inclusive">Inclusive</option>
+                    </flux:select>
+                        @if ($msg = $this->visibleError('amenityType'))
+                            <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $msg }}</p>
+                        @endif
+                    </flux:field>
+
+                   @if ($amenityType === 'Rentable')
+                    <flux:input
+                        wire:model="amenityPrice"
+                        type="number"
+                        step="0.01"
+                        min="0"
+                        label="Price"
+                        placeholder="0.00"
+                    />
+                    @endif
+
+                    @if ($amenityType === 'Rentable')
+                        <div class="space-y-2">
+                            <flux:label>Request limit per facility type <span class="text-red-500">*</span></flux:label>
+
+                            <div class="grid gap-3 sm:grid-cols-3">
+                                @foreach (['requestLimitCottage' => 'Cottage', 'requestLimitRoom' => 'Room', 'requestLimitFunctionHall' => 'Function Hall'] as $field => $label)
+                                    <flux:field class="relative">
+                                        <flux:label>{{ $label }}</flux:label>
+                                        <flux:input
+                                            wire:model="{{ $field }}"
+                                            type="number"
+                                            min="1"
+                                            max="1000"
+                                            step="1"
+                                            :invalid="$errors->has($field)"
+                                        />
+                                        @if ($msg = $this->visibleError($field))
+                                            <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $msg }}</p>
+                                        @endif
+                                    </flux:field>
+                                @endforeach
+                            </div>
+
+                            <flux:text class="text-xs">Most units that can be requested for one facility of that type (default 10).</flux:text>
+                        </div>
+                    @endif
+
+
+                    <div class="flex justify-end gap-3 pt-2">
+                        <flux:button
+                            type="button"
+                            wire:click="cancelEdit"
+                            variant="ghost"
+                        >
+                            Cancel
+                        </flux:button>
+
+                        <flux:button type="submit" variant="primary">
+                            {{ $editingId !== null
+                                ? 'Save Changes'
+                                : 'Save Amenity' }}
+                        </flux:button>
+                    </div>
+                </form>
+        </flux:modal>
+    </div>
+</div>

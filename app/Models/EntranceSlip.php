@@ -1,0 +1,125 @@
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\HasOne;
+
+class EntranceSlip extends Model
+{
+    use HasFactory;
+
+    /**
+     * A slip stays Unpaid on the day it is made. From the next day an unpaid slip is
+     * Closed: it can only be viewed and is not counted in any report.
+     */
+    public const STATUS_CLOSED = 'Closed';
+
+    protected $table = 'tbl_entrance_slip';
+
+    protected $primaryKey = 'entrance_slip_id';
+
+    protected $fillable = [
+        'no_of_adult',
+        'no_of_children',
+        'no_of_PWD_SC',
+        'no_of_Male',
+        'no_of_Female',
+        'no_of_Tourist',
+        'created_by_user_id',
+        'guest_id',
+        'date_created',
+        'time_created',
+        'total_price',
+        'amount_due',
+        'handled_by_user_id',
+        'admitted_by_user_id',
+        'admitted_at',
+        'voided_at',
+        'voided_by_user_id',
+        'void_reason',
+        'replacement_entrance_slip_id',
+        'status',
+    ];
+
+    protected function casts(): array
+    {
+        return [
+            'no_of_adult' => 'integer',
+            'no_of_children' => 'integer',
+            'no_of_PWD_SC' => 'integer',
+            'no_of_Male' => 'integer',
+            'no_of_Female' => 'integer',
+            'no_of_Tourist' => 'integer',
+            'date_created' => 'date',
+            'total_price' => 'decimal:2',
+            'amount_due' => 'decimal:2',
+            'admitted_at' => 'datetime',
+            'voided_at' => 'datetime',
+        ];
+    }
+
+    /**
+     * Closed, or still marked Unpaid but made on an earlier day (the nightly job has not
+     * run yet). Either way nothing can be done with the slip except view it.
+     */
+    public function isClosed(): bool
+    {
+        if ((string) $this->status === self::STATUS_CLOSED) {
+            return true;
+        }
+
+        return (string) $this->status === 'Unpaid'
+            && $this->admitted_at === null
+            && $this->date_created !== null
+            && $this->date_created->lt(today());
+    }
+
+    public function createdBy(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'created_by_user_id', 'user_id');
+    }
+
+    public function handledBy(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'handled_by_user_id', 'user_id');
+    }
+
+    public function admittedBy(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'admitted_by_user_id', 'user_id');
+    }
+
+    public function voidedBy(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'voided_by_user_id', 'user_id');
+    }
+
+    public function replacement(): BelongsTo
+    {
+        return $this->belongsTo(self::class, 'replacement_entrance_slip_id', 'entrance_slip_id');
+    }
+
+    public function guest(): BelongsTo
+    {
+        return $this->belongsTo(Guest::class, 'guest_id', 'guest_id');
+    }
+
+    public function details(): HasMany
+    {
+        return $this->hasMany(EntranceSlipDetail::class, 'entrance_slip_id', 'entrance_slip_id');
+    }
+
+    public function payments(): HasMany
+    {
+        return $this->hasMany(Payment::class, 'entrance_slip_id', 'entrance_slip_id');
+    }
+
+    public function booking(): HasOne
+    {
+        return $this->hasOne(Booking::class, 'entrance_slip_id', 'entrance_slip_id');
+    }
+}

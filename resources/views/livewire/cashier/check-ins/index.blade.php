@@ -1,0 +1,526 @@
+<?php
+
+use App\Models\BookingDetail;
+use App\Services\CheckInWorkflowService;
+use Illuminate\Support\Facades\Auth;
+use Livewire\Attributes\Url;
+use Livewire\Volt\Component;
+use Livewire\WithPagination;
+
+new class extends Component {
+    use WithPagination;
+
+    #[Url(as: 'q', except: '')]
+    public string $search = '';
+
+    #[Url(as: 'list', except: 'eligible')]
+    public string $statusFilter = 'eligible';
+
+    #[Url(as: 'arrival', except: 'today')]
+    public string $dateFilter = 'today';
+
+    #[Url(as: 'sort', except: 'check_in_date')]
+    public string $sortField = 'check_in_date';
+
+    #[Url(as: 'direction', except: 'asc')]
+    public string $sortDirection = 'asc';
+
+    #[Url(as: 'per_page', except: 10)]
+    public int $perPage = 10;
+
+    public ?int $selectedBookingDetailsId = null;
+    public string $selectedLabel = '';
+
+    public function mount(): void
+    {
+        $bookingId = request()->integer('booking');
+
+        if ($bookingId <= 0) {
+            return;
+        }
+
+        $eligibleDetails = BookingDetail::query()
+            ->with('booking')
+            ->where('booking_id', $bookingId)
+            ->whereIn('status', ['Booked', 'Rescheduled', 'Transferred', 'Extended'])
+            ->whereHas('booking', function ($query): void {
+                $query->where('amount_due', '<=', 0)
+                    ->whereNotIn('status', ['Cancelled', 'Checked-out']);
+            })
+            ->get();
+
+        $bookingReference = $eligibleDetails->first()?->booking?->b_ref_no;
+
+        if (filled($bookingReference)) {
+            $this->search = (string) $bookingReference;
+        }
+
+        if ($eligibleDetails->count() === 1) {
+            $this->selectCheckIn((int) $eligibleDetails->first()->booking_details_id);
+        }
+    }
+
+    public function with(): array
+    {
+        return [
+            'bookingDetails' => $this->bookingDetails(),
+        ];
+    }
+
+    public function updatedSearch(): void
+    {
+        $this->resetPage();
+    }
+
+    public function updatedStatusFilter(): void
+    {
+        $this->selectedBookingDetailsId = null;
+        $this->selectedLabel = '';
+        $this->resetPage();
+    }
+
+    public function updatedDateFilter(): void
+    {
+        $this->selectedBookingDetailsId = null;
+        $this->selectedLabel = '';
+        $this->resetPage();
+    }
+
+    public function updatedPerPage(): void
+    {
+        if (! in_array($this->perPage, [10, 25, 50, 100], true)) {
+            $this->perPage = 10;
+        }
+
+        $this->resetPage();
+    }
+
+    public function clearFilters(): void
+    {
+        $this->search = '';
+        $this->statusFilter = 'all';
+        $this->dateFilter = 'all';
+        $this->sortField = 'check_in_date';
+        $this->sortDirection = 'asc';
+        $this->perPage = 10;
+        $this->selectedBookingDetailsId = null;
+        $this->selectedLabel = '';
+
+        $this->resetPage();
+    }
+
+    public function sortIndicator(string $field): string
+    {
+        if ($this->sortField !== $field) {
+            return '↕';
+        }
+
+        return $this->sortDirection === 'asc' ? '↑' : '↓';
+    }
+
+    public function statusColor(string $status): string
+    {
+        return \App\Support\StatusColor::for($status);
+    }
+
+    public function sortBy(string $field): void
+    {
+        $allowed = ['booking_id', 'b_ref_no', 'guest_name', 'facility_name', 'check_in_date', 'check_out_date', 'amount_due', 'status'];
+
+        if (! in_array($field, $allowed, true)) {
+            return;
+        }
+
+        if ($this->sortField === $field) {
+            $this->sortDirection = $this->sortDirection === 'asc' ? 'desc' : 'asc';
+        } else {
+            $this->sortField = $field;
+            $this->sortDirection = 'asc';
+        }
+
+        $this->resetPage();
+    }
+
+    public bool $showCheckInModal = false;
+
+    public function selectCheckIn(int $bookingDetailsId): void
+    {
+        $detail = BookingDetail::query()
+            ->with(['booking.guest', 'facility'])
+            ->find($bookingDetailsId);
+
+        if (! $detail?->booking?->guest) {
+            $this->cancelSelection();
+            $this->addError('checkIn', 'This check-in is no longer available. Refresh the list and try again.');
+
+            return;
+        }
+
+        $guest = $detail->booking->guest;
+        $facilityName = optional($detail->facility)->facility_name ?? 'No facility';
+
+        $this->selectedBookingDetailsId = $bookingDetailsId;
+        $this->selectedLabel = $detail->booking->b_ref_no . ' - ' . $guest->first_name . ' ' . $guest->last_name . ' - ' . $facilityName;
+        $this->resetErrorBag('checkIn');
+        $this->showCheckInModal = true;
+    }
+
+    public function cancelSelection(): void
+    {
+        $this->showCheckInModal = false;
+        $this->selectedBookingDetailsId = null;
+        $this->selectedLabel = '';
+    }
+
+    public function confirmCheckIn(CheckInWorkflowService $checkInWorkflow): void
+    {
+        $validated = $this->validate([
+            'selectedBookingDetailsId' => ['required', 'integer', 'exists:tbl_booking_details,booking_details_id'],
+        ]);
+
+        try {
+            $checkInWorkflow->checkInBookingDetail(
+                (int) $validated['selectedBookingDetailsId'],
+                (int) Auth::id()
+            );
+
+            $this->cancelSelection();
+            $this->resetPage();
+            session()->flash('success', 'Guest checked in successfully.');
+        } catch (\InvalidArgumentException $exception) {
+            $this->addError('checkIn', $exception->getMessage());
+        } catch (\Throwable $exception) {
+            report($exception);
+            $this->addError('checkIn', 'Check-in could not be completed. Refresh the list and try again.');
+        }
+    }
+
+    private function bookingDetails()
+    {
+        $query = BookingDetail::query()
+            ->select('tbl_booking_details.*')
+            ->join('tbl_booking', 'tbl_booking.booking_id', '=', 'tbl_booking_details.booking_id')
+            ->join('tbl_guest', 'tbl_guest.guest_id', '=', 'tbl_booking.guest_id')
+            ->leftJoin('tbl_facility', 'tbl_facility.facility_id', '=', 'tbl_booking_details.facility_id')
+            ->with(['booking.guest', 'facility.facilityType']);
+        if($this->statusFilter === 'all'){
+            $query->whereNotIn('tbl_booking.status', ['Cancelled', 'Checked-out']);
+        }
+        else if ($this->statusFilter === 'checked_in') {
+            $query->where('tbl_booking_details.status', 'Checked-in');
+        } else {
+            $query->whereIn('tbl_booking_details.status', ['Booked', 'Rescheduled', 'Transferred', 'Extended'])
+                ->whereNotIn('tbl_booking.status', ['Cancelled', 'Checked-out'])
+                ->where('tbl_booking.amount_due', '<=', 0);
+        }
+
+        $searchText = trim($this->search);
+
+        if ($searchText !== '') {
+            $needle = '%' . $searchText . '%';
+
+            $query->where(function ($query) use ($needle): void {
+                $query->where('tbl_booking.b_ref_no', 'like', $needle)
+                    ->orWhere('tbl_guest.first_name', 'like', $needle)
+                    ->orWhere('tbl_guest.middle_name', 'like', $needle)
+                    ->orWhere('tbl_guest.last_name', 'like', $needle)
+                    ->orWhereRaw(\App\Support\NameSearch::sql('tbl_guest.first_name', 'tbl_guest.middle_name', 'tbl_guest.last_name'), \App\Support\NameSearch::bindings($needle))
+                    ->orWhere('tbl_guest.contact_no', 'like', $needle)
+                    ->orWhere('tbl_guest.email', 'like', $needle)
+                    ->orWhere('tbl_facility.facility_name', 'like', $needle);
+            });
+        }
+
+        if ($this->dateFilter === 'today') {
+            $query->whereDate(
+                'tbl_booking_details.check_in_date',
+                now()->toDateString(),
+            );
+        } elseif ($this->dateFilter === 'upcoming') {
+            $query->whereDate(
+                'tbl_booking_details.check_in_date',
+                '>',
+                now()->toDateString(),
+            );
+        } elseif ($this->dateFilter === 'overdue') {
+            $query->whereDate(
+                'tbl_booking_details.check_in_date',
+                '<',
+                now()->toDateString(),
+            );
+        }
+
+        $direction = $this->sortDirection === 'desc' ? 'desc' : 'asc';
+
+        if ($this->sortField === 'guest_name') {
+            $query->orderBy('tbl_guest.last_name', $direction)
+                ->orderBy('tbl_guest.first_name', $direction);
+        } elseif ($this->sortField === 'facility_name') {
+            $query->orderBy('tbl_facility.facility_name', $direction);
+        } else {
+            $sortMap = [
+                'booking_id' => 'tbl_booking.booking_id',
+                'b_ref_no' => 'tbl_booking.b_ref_no',
+                'check_in_date' => 'tbl_booking_details.check_in_date',
+                'check_out_date' => 'tbl_booking_details.check_out_date',
+                'amount_due' => 'tbl_booking.amount_due',
+                'status' => 'tbl_booking_details.status',
+            ];
+
+            $sortColumn = $sortMap[$this->sortField] ?? 'tbl_booking_details.check_in_date';
+            $query->orderBy($sortColumn, $direction);
+        }
+
+        $perPage = in_array($this->perPage, [10, 25, 50, 100], true)
+            ? $this->perPage
+            : 10;
+
+        return $query->paginate($perPage);
+    }
+};
+?>
+
+<div class="space-y-6">
+    <x-staff-page-header
+        eyebrow="Cashier operations"
+        title="Cashier Check-in"
+        description="Review fully paid booking candidates and confirm eligible arrivals before marking facilities as occupied."
+    />
+
+    <x-toast :message="session('success')" fresh />
+
+    @if (! $showCheckInModal)
+    @error('checkIn')
+        <div class="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200">
+            {{ $message }}
+        </div>
+    @enderror
+    @endif
+
+    <flux:card class="overflow-hidden p-0">
+        
+            <div class="grid gap-3 border-b border-zinc-200 p-5 md:grid-cols-4 dark:border-zinc-800">
+                    <flux:input
+                        label="Search"
+                        placeholder="Reference, guest"
+                        wire:model.live.debounce.300ms="search"
+                        clearable
+                    />
+                    <flux:select
+                        label="List"
+                        wire:model.live="statusFilter"
+                    >
+                        <option value="all">All</option>
+                        <option value="eligible">Check-in candidates</option>
+                        <option value="checked_in">Already checked-in</option>
+                    </flux:select>
+
+                    <flux:select
+                        label="Scheduled arrival"
+                        wire:model.live="dateFilter"
+                    >
+                        <option value="all">All</option>
+                        <option value="today">Due today</option>
+                        <option value="upcoming">Upcoming</option>
+                        <option value="overdue">Past scheduled date</option>
+                    </flux:select>
+
+                    <div class="flex items-end gap-2">
+                    <flux:select
+                        label="Rows"
+                        wire:model.live="perPage"
+                    >
+                        <option value="10">10</option>
+                        <option value="25">25</option>
+                        <option value="50">50</option>
+                        <option value="100">100</option>
+                    </flux:select>
+
+                <flux:button type="button" wire:click="clearFilters" variant="ghost">Clear Filters</flux:button>
+                </div>
+            </div>
+        
+
+        <div class="overflow-x-auto" wire:loading.class="opacity-60" wire:target="search,statusFilter,dateFilter,perPage,sortBy,clearFilters">
+            <table class="w-full min-w-[88rem] text-left text-sm">
+                <thead class="border-b border-brand-border bg-zinc-50 text-xs uppercase tracking-wide text-brand-text-muted dark:border-zinc-800 dark:bg-zinc-950/60 dark:text-zinc-400">
+                    <tr>
+                        <th class="px-4 py-3">
+                            <button
+                                type="button"
+                                wire:click="sortBy('b_ref_no')"
+                                class="font-semibold transition hover:text-brand-text dark:hover:text-white"
+                            >
+                                REFERENCE {{ $this->sortIndicator('b_ref_no') }}
+                            </button>
+                        </th>
+
+                        <th class="px-4 py-3">
+                            <button
+                                type="button"
+                                wire:click="sortBy('guest_name')"
+                                class="font-semibold transition hover:text-brand-text dark:hover:text-white"
+                            >
+                                GUEST {{ $this->sortIndicator('guest_name') }}
+                            </button>
+                        </th>
+
+                        <th class="px-4 py-3">
+                            <button
+                                type="button"
+                                wire:click="sortBy('facility_name')"
+                                class="font-semibold transition hover:text-brand-text dark:hover:text-white"
+                            >
+                                FACILITY {{ $this->sortIndicator('facility_name') }}
+                            </button>
+                        </th>
+
+                        <th class="px-4 py-3 font-semibold">Rate</th>
+
+                        <th class="px-4 py-3">
+                            <button
+                                type="button"
+                                wire:click="sortBy('check_in_date')"
+                                class="font-semibold transition hover:text-brand-text dark:hover:text-white"
+                            >
+                                CHECK-IN {{ $this->sortIndicator('check_in_date') }}
+                            </button>
+                        </th>
+
+                        <th class="px-4 py-3">
+                            <button
+                                type="button"
+                                wire:click="sortBy('check_out_date')"
+                                class="font-semibold transition hover:text-brand-text dark:hover:text-white"
+                            >
+                                CHECK-OUT {{ $this->sortIndicator('check_out_date') }}
+                            </button>
+                        </th>
+
+                        <th class="px-4 py-3">
+                            <button
+                                type="button"
+                                wire:click="sortBy('amount_due')"
+                                class="font-semibold transition hover:text-brand-text dark:hover:text-white"
+                            >
+                                BALANCE {{ $this->sortIndicator('amount_due') }}
+                            </button>
+                        </th>
+
+                        <th class="px-4 py-3">
+                            <button
+                                type="button"
+                                wire:click="sortBy('status')"
+                                class="font-semibold transition hover:text-brand-text dark:hover:text-white"
+                            >
+                                STATUS {{ $this->sortIndicator('status') }}
+                            </button>
+                        </th>
+
+                        <th class="px-4 py-3 text-right font-semibold">Actions</th>
+                    </tr>
+                </thead>
+
+                <tbody class="divide-y divide-brand-border/70 dark:divide-zinc-800">
+                    @forelse ($bookingDetails as $detail)
+                        <tr
+                            wire:key="check-in-detail-{{ $detail->booking_details_id }}"
+                            class="align-top text-brand-text transition-colors dark:text-zinc-200 {{ $selectedBookingDetailsId === (int) $detail->booking_details_id ? 'bg-blue-50 ring-1 ring-inset ring-blue-200 dark:bg-blue-950/30 dark:ring-blue-800' : 'hover:bg-brand-surface-muted/70 dark:hover:bg-zinc-800/60' }}"
+                        >
+                            <td class="px-4 py-4 font-medium">{{ $detail->booking->b_ref_no }}</td>
+                            <td class="px-4 py-4">
+                                <p class="font-medium">
+                                    {{ $detail->booking->guest->first_name }} {{ $detail->booking->guest->last_name }}
+                                </p>
+
+                                <p class="mt-1 text-xs text-brand-text-muted dark:text-zinc-400">
+                                    {{ $detail->booking->guest->contact_no }}
+                                </p>
+                            </td>
+                            <td class="px-4 py-4">
+                                <p class="font-medium">
+                                    {{ optional($detail->facility)->facility_name ?? 'No facility' }}
+                                </p>
+
+                                <p class="mt-1 text-xs text-brand-text-muted dark:text-zinc-400">
+                                    {{ optional(optional($detail->facility)->facilityType)->facility_type }}
+                                </p>
+                            </td>
+                            <td class="px-4 py-4">{{ $detail->rate_type }}</td>
+                            <td class="px-4 py-4">{{ optional($detail->check_in_date)->format('M d, Y') ?? $detail->check_in_date }}</td>
+                            <td class="px-4 py-4">{{ optional($detail->check_out_date)->format('M d, Y') ?? $detail->check_out_date }}</td>
+                            <td class="px-4 py-4">₱{{ number_format((float) $detail->booking->amount_due, 2) }}</td>
+                            <td class="px-4 py-4">
+                                <flux:badge
+                                    color="{{ $this->statusColor((string) $detail->status) }}"
+                                    size="sm"
+                                >
+                                    {{ $detail->status }}
+                                </flux:badge>
+                            </td>
+                            <td class="px-4 py-4 text-right">
+                                <div class="flex justify-end">
+                                    <x-table-actions label="Actions for booking {{ $detail->booking->b_ref_no }}">
+                                        @if (Route::has('cashier.bookings.show'))
+                                            <flux:menu.item
+                                                icon="eye"
+                                                href="{{ route('cashier.bookings.show', $detail->booking_id) }}"
+                                                wire:navigate
+                                            >
+                                                View booking
+                                            </flux:menu.item>
+                                        @endif
+
+                                        @if ($statusFilter === 'eligible')
+                                            <flux:menu.item
+                                                icon="check-circle"
+                                                wire:click="selectCheckIn({{ $detail->booking_details_id }})"
+                                            >
+                                                Check-in
+                                            </flux:menu.item>
+                                        @else
+                                            <flux:menu.item icon="check" disabled>Checked in at {{ $detail->check_in_time ?? 'recorded' }}</flux:menu.item>
+                                        @endif
+                                    </x-table-actions>
+                                </div>
+                            </td>
+                        </tr>
+                    @empty
+                        <tr>
+                            <td colspan="9" class="px-5 py-6">
+                                <x-dashboard-empty-state
+                                    title="No check-in records found"
+                                    description="No facility check-in record matches the selected search, list, and scheduled-arrival filters."
+                                    class="border-0 bg-transparent py-6 shadow-none dark:bg-transparent"
+                                />
+                            </td>
+                        </tr>
+                    @endforelse
+                </tbody>
+            </table>
+
+
+        </div>
+
+        <div class="border-t border-zinc-200 px-5 py-4 dark:border-zinc-800">
+            {{ $bookingDetails->links() }}
+        </div>
+    </flux:card>
+    <flux:modal wire:model="showCheckInModal" class="md:w-[30rem]">
+        <div class="space-y-5">
+            <div>
+                <flux:heading size="lg">Confirm check-in</flux:heading>
+                <flux:text class="mt-1">{{ $selectedLabel }}</flux:text>
+            </div>
+
+            @error('checkIn')
+                <div class="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200">{{ $message }}</div>
+            @enderror
+
+            <div class="flex justify-end gap-3">
+                <flux:button type="button" variant="ghost" wire:click="cancelSelection">Cancel</flux:button>
+                <flux:button type="button" variant="primary" wire:click="confirmCheckIn">Confirm Check-in</flux:button>
+            </div>
+        </div>
+    </flux:modal>
+</div>

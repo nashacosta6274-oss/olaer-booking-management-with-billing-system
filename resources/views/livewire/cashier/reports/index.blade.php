@@ -1,0 +1,581 @@
+<?php
+
+use App\Services\ReportsService;
+use Carbon\CarbonImmutable;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Validation\Rule;
+use Livewire\Attributes\Layout;
+use Livewire\Attributes\Title;
+use Livewire\Attributes\Url;
+use Livewire\Volt\Component;
+use Livewire\WithPagination;
+
+new #[Layout('layouts.app')] #[Title('Cashier Reports - Olaer Spring Resort')] class extends Component
+{
+
+    public function updated(string $property): void
+    {
+        // Clear the red highlight of a field as soon as the user edits it.
+        $this->resetValidation($property);
+    }
+
+    /** Error text for a required field; an empty required field only turns red (no text). */
+    public function visibleError(string $field): ?string
+    {
+        $message = $this->getErrorBag()->first($field);
+
+        if ($message === '') {
+            return null;
+        }
+
+        $value = data_get($this, $field);
+
+        return $value === null || $value === '' || $value === [] ? null : $message;
+    }
+    use WithPagination;
+
+    #[Url(as: 'report', except: 'revenue')]
+    public string $reportType = 'revenue';
+
+    #[Url(as: 'start', except: '')]
+    public string $startDate = '';
+
+    #[Url(as: 'end', except: '')]
+    public string $endDate = '';
+
+    #[Url(as: 'facility_type', except: '')]
+    public string $facilityTypeId = '';
+
+    #[Url(as: 'month', except: '')]
+    public string $month = '';
+
+    #[Url(as: 'year', except: '')]
+    public string $year = '';
+
+    #[Url(as: 'generated', except: false)]
+    public bool $generated = false;
+
+    #[Url(as: 'q', except: '')]
+    public string $reportSearch = '';
+
+    #[Url(as: 'per_page', except: 25)]
+    public int $perPage = 25;
+
+    #[Url(as: 'print_all', except: false)]
+    public bool $printAll = false;
+
+    public function mount(): void
+    {
+        $today = now()->toDateString();
+
+        if ($this->startDate === '') {
+            $this->startDate = $today;
+        }
+
+        if ($this->endDate === '') {
+            $this->endDate = $today;
+        }
+
+        if ($this->month === '') {
+            $this->month = (string) now()->month;
+        }
+
+        if ($this->year === '') {
+            $this->year = (string) now()->year;
+        }
+    }
+
+    public function with(): array
+    {
+        if ($this->generated && validator($this->reportInputs(), $this->reportRules())->fails()) {
+            $this->generated = false;
+            $this->addError('reportType', 'Report filters are invalid. Review the fields and generate the report again.');
+        }
+
+        if (! $this->generated) {
+            $this->printAll = false;
+        }
+
+        $service = app(ReportsService::class);
+
+        return [
+            'facilityTypes' => $service->facilityTypes(),
+            'report' => $this->generated
+                ? $this->buildReport($service)
+                : null,
+            'reportTitle' => $this->reportTitle(),
+        ];
+    }
+
+    public function generate(): void
+    {
+        $this->validate($this->reportRules());
+
+        $this->generated = true;
+        $this->printAll = false;
+        $this->resetPage('reportPage');
+    }
+
+    private function reportInputs(): array
+    {
+        return [
+            'reportType' => $this->reportType,
+            'perPage' => $this->perPage,
+            'reportSearch' => $this->reportSearch,
+            'startDate' => $this->startDate,
+            'endDate' => $this->endDate,
+            'month' => $this->month,
+            'year' => $this->year,
+            'facilityTypeId' => $this->facilityTypeId,
+        ];
+    }
+
+    private function reportRules(): array
+    {
+        $rules = [
+            'reportType' => [
+                'required',
+                Rule::in(['revenue', 'booking_summary', 'cancellation', 'damaged_amenities', 'available_facilities']),
+            ],
+            'perPage' => ['required', 'integer', Rule::in([10, 25, 50, 100])],
+            'reportSearch' => ['nullable', 'string', 'max:100'],
+        ];
+
+        $rules['startDate'] = ['required', 'date_format:Y-m-d'];
+        $rules['endDate'] = ['required', 'date_format:Y-m-d', 'after_or_equal:startDate'];
+
+        if ($this->usesFacilityType()) {
+            $rules['facilityTypeId'] = [
+                'nullable',
+                'integer',
+                'exists:tbl_facility_type,facility_type_id',
+            ];
+        }
+
+        return $rules;
+    }
+
+    public function clearReport(): void
+    {
+        $this->generated = false;
+        $this->printAll = false;
+        $this->reportSearch = '';
+        $this->resetPage('reportPage');
+    }
+
+    public function updatedReportType(): void
+    {
+        $this->invalidateReport();
+    }
+
+    public function updatedStartDate(): void
+    {
+        $this->invalidateReport();
+    }
+
+    public function updatedEndDate(): void
+    {
+        $this->invalidateReport();
+    }
+
+    public function updatedFacilityTypeId(): void
+    {
+        $this->invalidateReport();
+    }
+
+    public function updatedMonth(): void
+    {
+        $this->invalidateReport();
+    }
+
+    public function updatedYear(): void
+    {
+        $this->invalidateReport();
+    }
+
+    public function updatedReportSearch(): void
+    {
+        $this->resetPage('reportPage');
+    }
+
+    public function updatedPerPage(): void
+    {
+        if (! in_array($this->perPage, [10, 25, 50, 100], true)) {
+            $this->perPage = 25;
+        }
+
+        $this->resetPage('reportPage');
+    }
+
+    public function usesFacilityType(): bool
+    {
+        return in_array(
+            $this->reportType,
+            ['available_facilities'],
+            true,
+        );
+    }
+
+    public function usesMonthYear(): bool
+    {
+        return $this->reportType === 'tourism';
+    }
+
+    public function money(mixed $amount): string
+    {
+        return '₱'.number_format((float) $amount, 2);
+    }
+
+    public function guestName(mixed $guest): string
+    {
+        if ($guest === null) {
+            return 'Walk-in / Unknown';
+        }
+
+        return $guest->full_name
+            ?? trim(implode(' ', array_filter([
+                $guest->first_name,
+                $guest->middle_name,
+                $guest->last_name,
+            ])))
+            ?: 'Walk-in / Unknown';
+    }
+
+    public function staffName(
+        mixed $staff,
+        string $fallback = 'N/A',
+    ): string {
+        if ($staff === null) {
+            return $fallback;
+        }
+
+        return $staff->full_name
+            ?? trim(implode(' ', array_filter([
+                $staff->first_name,
+                $staff->middle_name,
+                $staff->last_name,
+            ])))
+            ?: ($staff->username ?? $fallback);
+    }
+
+    public function paymentTargetLabel(mixed $payment): string
+    {
+        if ($payment->booking !== null) {
+            return 'Booking '.$payment->booking->b_ref_no;
+        }
+
+        if ($payment->reservation !== null) {
+            return 'Reservation '.$payment->reservation->r_ref_no;
+        }
+
+        if ($payment->entranceSlip !== null) {
+            return 'Entrance Slip #'
+                .$payment->entranceSlip->entrance_slip_id;
+        }
+
+        return 'Unknown';
+    }
+
+    public function reportTitle(): string
+    {
+        return match ($this->reportType) {
+            'revenue' => 'Revenue Report',
+            'booking_summary' => 'Booking Summary Report',
+            'cancellation' => 'Cancellation Report',
+            'damaged_amenities' => 'Damaged Amenities Report',
+            'available_facilities' => 'Available Facilities Report',
+            'facility_utilization' => 'Facility Utilization Report',
+            'tourism' => 'Tourism Enterprise Monthly Report',
+            default => 'Report',
+        };
+    }
+
+    public function printUrl(): string
+    {
+        return route('cashier.reports.index', [
+            'report' => $this->reportType,
+            'start' => $this->startDate,
+            'end' => $this->endDate,
+            'facility_type' => $this->facilityTypeId,
+            'month' => $this->month,
+            'year' => $this->year,
+            'generated' => 1,
+            'q' => $this->reportSearch,
+            'per_page' => $this->perPage,
+            'print_all' => 1,
+        ]);
+    }
+
+    public function paginatedUrl(): string
+    {
+        return route('cashier.reports.index', [
+            'report' => $this->reportType,
+            'start' => $this->startDate,
+            'end' => $this->endDate,
+            'facility_type' => $this->facilityTypeId,
+            'month' => $this->month,
+            'year' => $this->year,
+            'generated' => 1,
+            'q' => $this->reportSearch,
+            'per_page' => $this->perPage,
+        ]);
+    }
+
+    private function invalidateReport(): void
+    {
+        $this->generated = false;
+        $this->printAll = false;
+        $this->resetPage('reportPage');
+    }
+
+    private function buildReport(ReportsService $service): array
+    {
+        $facilityTypeId = $this->facilityTypeId !== ''
+            ? (int) $this->facilityTypeId
+            : null;
+
+        return match ($this->reportType) {
+            'revenue' => $service->revenueReport(
+                $this->startDate,
+                $this->endDate,
+                (int) Auth::id(),
+                $this->perPage,
+                $this->reportSearch,
+                'reportPage',
+                $this->printAll,
+            ),
+            'booking_summary' => $service->bookingSummaryReport(
+                $this->startDate,
+                $this->endDate,
+                null,
+                $this->perPage,
+                $this->reportSearch,
+                'reportPage',
+                $this->printAll,
+            ),
+            'cancellation' => $service->cancellationReport(
+                $this->startDate,
+                $this->endDate,
+                $this->perPage,
+                $this->reportSearch,
+                'reportPage',
+                $this->printAll,
+            ),
+            'damaged_amenities' => $service->damagedAmenitiesReport(
+                $this->startDate,
+                $this->endDate,
+                $this->perPage,
+                $this->reportSearch,
+                'reportPage',
+                $this->printAll,
+            ),
+            'available_facilities' => $service->availableFacilitiesReport(
+                $this->startDate,
+                $this->endDate,
+                $facilityTypeId,
+                $this->perPage,
+                $this->reportSearch,
+                'reportPage',
+                $this->printAll,
+            ),
+            default => [
+                'rows' => collect(),
+                'count' => 0,
+            ],
+        };
+    }
+};
+
+?>
+
+<div class="space-y-6">
+    <style>
+        /* The margin lives on the page itself so every printed page gets it.
+           (Body padding only applied to the first/last page edges.) */
+        @page { margin: 12mm; }
+        @media print {
+            body { background: white !important; padding: 0 !important; margin: 0 !important; }
+            tr, .rounded-lg { break-inside: avoid; }
+            thead { display: table-header-group; }
+            header {
+                display: none !important;
+            }
+        }
+    </style>
+    <div class="flex flex-col gap-3 md:flex-row md:items-end md:justify-between print:hidden">
+        <div>
+            <h1 class="text-2xl font-bold tracking-tight text-zinc-900 dark:text-zinc-100">
+                Cashier Reports
+            </h1>
+
+            <p class="text-sm text-zinc-600 dark:text-zinc-400">
+                Generate, filter, paginate, and print cashier operational reports.
+            </p>
+        </div>
+
+        <div class="flex flex-wrap gap-2">
+            @if ($generated && ! $printAll)
+                <flux:button
+                    href="{{ $this->printUrl() }}"
+                    target="_blank"
+                    variant="primary"
+                >
+                    Print Full Report
+                </flux:button>
+            @elseif ($generated && $printAll)
+                <flux:button
+                    type="button"
+                    onclick="window.print()"
+                    variant="primary"
+                >
+                    Print
+                </flux:button>
+
+                <flux:button
+                    href="{{ $this->paginatedUrl() }}"
+                    variant="ghost"
+                >
+                    Return to Paginated View
+                </flux:button>
+            @endif
+        </div>
+    </div>
+
+    @if (! $printAll)
+        <flux:card class="print:hidden">
+            <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+                <flux:field class="relative">
+                    <flux:label>Report Type <span class="text-red-500">*</span></flux:label>
+                    <flux:select wire:model.live="reportType" :invalid="$errors->has('reportType')">
+                    <option value="revenue">My Handled Revenue</option>
+                    <option value="booking_summary">Booking Summary</option>
+                    <option value="cancellation">Cancellation</option>
+                    <option value="damaged_amenities">Damaged Amenities</option>
+                    <option value="available_facilities">Available Facilities</option>
+                </flux:select>
+                    @if ($msg = $this->visibleError('reportType'))
+                        <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $msg }}</p>
+                    @endif
+                </flux:field>
+
+                @if ($this->usesMonthYear())
+                    <flux:select wire:model.live="month" label="Month">
+                        @foreach (range(1, 12) as $monthNumber)
+                            <option value="{{ $monthNumber }}">
+                                {{ CarbonImmutable::create(2026, $monthNumber, 1)->format('F') }}
+                            </option>
+                        @endforeach
+                    </flux:select>
+
+                    <flux:field>
+                        <flux:label class="flex items-center gap-2">Year <span wire:loading.inline-flex wire:target="year" class="hidden items-center"><flux:icon.loading class="size-4" /></span></flux:label>
+                        <flux:input wire:model.live="year" type="number" min="2000" max="2100" :loading="false" />
+                        <flux:error name="year" />
+                    </flux:field>
+                @else
+                    <flux:field>
+                        <flux:label class="flex items-center gap-2">Start Date <span wire:loading.inline-flex wire:target="startDate" class="hidden items-center"><flux:icon.loading class="size-4" /></span></flux:label>
+                        <flux:input wire:model.live="startDate" type="date" :loading="false" />
+                        <flux:error name="startDate" />
+                    </flux:field>
+
+                    <flux:field>
+                        <flux:label class="flex items-center gap-2">End Date <span wire:loading.inline-flex wire:target="endDate" class="hidden items-center"><flux:icon.loading class="size-4" /></span></flux:label>
+                        <flux:input wire:model.live="endDate" type="date" :loading="false" />
+                        <flux:error name="endDate" />
+                    </flux:field>
+                @endif
+
+                @if ($this->usesFacilityType())
+                    <flux:select
+                        wire:model.live="facilityTypeId"
+                        label="Facility Type"
+                    >
+                        <option value="">All facility types</option>
+
+                        @foreach ($facilityTypes as $facilityType)
+                            <option value="{{ $facilityType->facility_type_id }}">
+                                {{ $facilityType->facility_type }}
+                            </option>
+                        @endforeach
+                    </flux:select>
+                @endif
+            </div>
+
+            <div class="mt-4 flex flex-wrap gap-2">
+                <flux:button wire:click="generate" variant="primary">
+                    Generate Report
+                </flux:button>
+
+                <flux:button wire:click="clearReport" variant="ghost">
+                    Clear
+                </flux:button>
+            </div>
+
+            
+
+            @error('startDate')
+                <p class="mt-2 text-sm text-red-600">{{ $message }}</p>
+            @enderror
+
+            @error('endDate')
+                <p class="mt-2 text-sm text-red-600">{{ $message }}</p>
+            @enderror
+
+            @error('month')
+                <p class="mt-2 text-sm text-red-600">{{ $message }}</p>
+            @enderror
+
+            @error('year')
+                <p class="mt-2 text-sm text-red-600">{{ $message }}</p>
+            @enderror
+
+            @error('facilityTypeId')
+                <p class="mt-2 text-sm text-red-600">{{ $message }}</p>
+            @enderror
+        </flux:card>
+    @endif
+
+    @if (! $generated)
+        <div class="rounded-xl border border-dashed border-zinc-300 bg-zinc-50 p-8 text-center text-sm text-zinc-600 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400">
+            Choose a report type and click <strong>Generate Report</strong>.
+        </div>
+    @else
+        @if (! $printAll)
+            <flux:card class="print:hidden">
+                <div class="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                    <flux:field class="xl:col-span-2">
+                        <flux:label class="flex items-center gap-2">Search generated report <span wire:loading.inline-flex wire:target="reportSearch" class="hidden items-center"><flux:icon.loading class="size-4" /></span></flux:label>
+                        <flux:input
+                            wire:model.live.debounce.300ms="reportSearch"
+                            :loading="false"
+                            placeholder="Reference, guest, facility, staff, or status"
+                            clearable
+                        />
+                        <flux:error name="reportSearch" />
+                    </flux:field>
+
+                    <flux:select wire:model.live="perPage" label="Rows per page">
+                        <option value="10">10</option>
+                        <option value="25">25</option>
+                        <option value="50">50</option>
+                        <option value="100">100</option>
+                    </flux:select>
+
+                    <div class="flex items-end">
+                        <flux:button
+                            href="{{ $this->printUrl() }}"
+                            target="_blank"
+                            variant="ghost"
+                            class="w-full"
+                        >
+                            Open Full Print View
+                        </flux:button>
+                    </div>
+                </div>
+            </flux:card>
+        @endif
+
+        @include('livewire.reports.partials.report-output')
+    @endif
+</div>

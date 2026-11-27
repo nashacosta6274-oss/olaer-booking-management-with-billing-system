@@ -1,0 +1,176 @@
+<?php
+
+namespace App\Services;
+
+use App\Models\Discount;
+use App\Models\Facility;
+use Carbon\CarbonImmutable;
+use Illuminate\Support\Carbon;
+use InvalidArgumentException;
+
+class ReservationQuoteService
+{
+    private const ROOM_EXTRA_GUEST_PRICE = '100.00';
+
+    public function __construct(
+        private readonly FacilityOccupancyService $occupancy,
+        private readonly FacilityProductConfigurationService $products,
+        private readonly DecimalMoneyService $money,
+        private readonly DiscountResolverService $discountResolver,
+    ) {}
+
+    public function quote(
+        int $facilityId,
+        string $rateType,
+        string $checkInDate,
+        string $checkOutDate,
+        ?int $discountId = null,
+        int $extraGuestCount = 0,
+        ?int $totalGuestCount = null,
+    ): array {
+        $facility = $this->products->configuredFacility($facilityId);
+        $productRate = $this->products->rateFor($facility, $rateType);
+
+        $resolvedTotalGuestCount = $totalGuestCount
+            ?? $this->occupancy->legacyTotalGuestCount(
+                $facility,
+                $extraGuestCount,
+            );
+
+        $occupancy = $this->occupancy->forFacility(
+            $facility,
+            $resolvedTotalGuestCount,
+        );
+
+        $baseUnits = $this->billableUnits(
+            $rateType,
+            $checkInDate,
+            $checkOutDate,
+        );
+        $basePrice = $this->money->multiply(
+            $productRate->amount,
+            $baseUnits,
+        );
+        // The extra-guest fee is charged per extra guest, per billable day:
+        // 100 x extra guests x days (e.g. 5 guests in a room that fits 4, for 3 days = 300).
+        $extraGuestCharge = $this->money->multiply(
+            $this->money->multiply(
+                self::ROOM_EXTRA_GUEST_PRICE,
+                $occupancy['paid_extra_guest_count'],
+            ),
+            $baseUnits,
+        );
+        $discountRate = '0.000000';
+        $discountAmount = '0.00';
+        $discountName = null;
+
+        if ($discountId) {
+            $discount = Discount::query()->find($discountId);
+
+            if (
+                ! $discount
+                || ! $this->discountAppliesToFacility(
+                    $discount,
+                    $facility,
+                )
+            ) {
+                throw new InvalidArgumentException(
+                    'The selected discount does not apply to this facility.'
+                );
+            }
+
+            if (! $this->discountIsValidForDate($discount, $facility, $checkInDate)) {
+                throw new InvalidArgumentException(
+                    'The selected discount is inactive or outside its validity period.'
+                );
+            }
+
+            $discountRate = $this->money->discountRate(
+                $discount->discount_amount,
+            );
+            $discountAmount = $this->money->percentage(
+                $basePrice,
+                $discountRate,
+            );
+            $discountName = $discount->discount_name;
+        }
+
+        $totalPrice = $this->money->maxZero(
+            $this->money->subtract(
+                $this->money->add($basePrice, $extraGuestCharge),
+                $discountAmount,
+            ),
+        );
+        $detailSnapshot = $this->products->detailSnapshot(
+            facility: $facility,
+            rate: $productRate,
+            guestCount: $resolvedTotalGuestCount,
+            basePrice: $basePrice,
+            discountRate: $discountRate,
+            discountAmount: $discountAmount,
+            extraGuestFee: $extraGuestCharge,
+            lineTotal: $totalPrice,
+        );
+
+        return [
+            'facility_id' => $facility->facility_id,
+            'facility_name' => $facility->facility_name,
+            'facility_type' => $facility->facilityType?->facility_type,
+            'rate_type' => $this->products->canonicalRateType($productRate),
+            'capacity' => $occupancy['capacity'],
+            'total_guest_count' => $occupancy['total_guest_count'],
+            'included_guest_count' => $occupancy['included_guest_count'],
+            'extra_guest_count' => $occupancy['paid_extra_guest_count'],
+            'max_paid_extra_guests' => $occupancy['max_paid_extra_guests'],
+            'base_units' => $baseUnits,
+            'base_price' => $basePrice,
+            'extra_guest_charge' => $extraGuestCharge,
+            'discount_id' => $discountId,
+            'discount_name' => $discountName,
+            'discount_rate' => $discountRate,
+            'discount_amount' => $discountAmount,
+            'total_price' => $totalPrice,
+            'amount_due' => $totalPrice,
+            'detail_snapshot' => $detailSnapshot,
+        ];
+    }
+
+    private function billableUnits(
+        string $rateType,
+        string $checkInDate,
+        string $checkOutDate,
+    ): int {
+        $start = CarbonImmutable::parse($checkInDate)->startOfDay();
+        $end = CarbonImmutable::parse($checkOutDate)->startOfDay();
+
+        if ($end->lessThan($start)) {
+            throw new InvalidArgumentException(
+                'Check-out date cannot be before check-in date.'
+            );
+        }
+
+        return (int) max($start->diffInDays($end), 1);
+    }
+
+    private function discountAppliesToFacility(
+        Discount $discount,
+        Facility $facility,
+    ): bool {
+        return match ($facility->facilityType?->facility_type) {
+            'Cottage' => (bool) $discount->app_to_cottage,
+            'Room' => (bool) $discount->app_to_room,
+            'Function Hall' => (bool) $discount->app_to_function_hall,
+            default => false,
+        };
+    }
+
+    private function discountIsValidForDate(
+        Discount $discount,
+        Facility $facility,
+        string $checkInDate,
+    ): bool {
+        // Same rule as the resolver: must be Active, have both a start and an end,
+        // and be running at the effective time (right now if the date is today).
+        return $this->discountResolver->appliesToFacilityOn($discount, $facility, $checkInDate);
+    }
+}

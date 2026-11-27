@@ -1,0 +1,1518 @@
+<?php
+
+use App\Models\Facility;
+use App\Models\Guest;
+use App\Models\ModeOfPayment;
+use App\Models\RefundRequest;
+use App\Models\Reservation;
+use App\Models\ReservationDetail;
+use App\Models\FacilityProduct;
+use App\Services\DecimalMoneyService;
+use App\Services\FacilityAvailabilityService;
+use App\Services\RefundRequestWorkflowService;
+use App\Services\StaffReservationCancellationService;
+use App\Services\ReservationFacilityOperationService;
+use App\Services\RoomOccupantService;
+use Illuminate\Pagination\LengthAwarePaginator;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Validation\Rule;
+use Livewire\Attributes\Layout;
+use Livewire\Attributes\Title;
+use Livewire\Attributes\Url;
+use Livewire\Volt\Component;
+use Livewire\WithPagination;
+
+new #[Layout('layouts.app')] #[Title('Reservation Management - Olaer Spring Resort')] class extends Component
+{
+    public function mount(): void
+    {
+        // The list starts on today; a date in the address bar still wins.
+        if ($this->dateFrom === '' && ! request()->has('date_from')) {
+            $this->dateFrom = now()->toDateString();
+        }
+    }
+
+
+    public function updated(string $property): void
+    {
+        // Clear the red highlight of a field as soon as the user edits it.
+        $this->resetValidation($property);
+    }
+
+    /** Error text for a required field; an empty required field only turns red (no text). */
+    public function visibleError(string $field): ?string
+    {
+        $message = $this->getErrorBag()->first($field);
+
+        if ($message === '') {
+            return null;
+        }
+
+        $value = data_get($this, $field);
+
+        return $value === null || $value === '' || $value === [] ? null : $message;
+    }
+    use WithPagination;
+
+    #[Url(as: 'q', except: '')]
+    public string $search = '';
+
+    #[Url(as: 'date_from', except: '')]
+    public string $dateFrom = '';
+
+    #[Url(as: 'date_to', except: '')]
+    public string $dateTo = '';
+
+    #[Url(as: 'status', except: 'Active')]
+    public string $statusFilter = 'Active';
+
+    #[Url(as: 'sort', except: 'reservation_id')]
+    public string $sortField = 'reservation_id';
+
+    #[Url(as: 'direction', except: 'desc')]
+    public string $sortDirection = 'desc';
+
+    #[Url(as: 'per_page', except: 10)]
+    public int $perPage = 10;
+
+    public bool $showDetailActionModal = false;
+    public bool $showCancelReservationModal = false;
+
+    public ?int $cancelReservationId = null;
+    public string $cancellationReason = '';
+
+    public bool $showRefundModal = false;
+    public ?int $refundReservationId = null;
+    public string $refundNote = '';
+
+    // Giving an approved refund back to the guest
+    public bool $showReleaseModal = false;
+    public ?int $releaseRequestId = null;
+    public string $releaseAmount = '';
+    public string $releaseModeId = '';
+    public string $releaseNote = '';
+    public string $releaseContact = '';
+
+    public ?int $detailActionId = null;
+    public ?string $detailAction = null;
+    public string $detailCheckInDate = '';
+    public string $detailCheckOutDate = '';
+    public string $detailOriginalDays = ''; // display only; the real length is re-read on save
+    public string $detailFacilityProductId = '';
+    public string $detailFacilityId = '';
+    public string $detailCancellationReason = '';
+    public array $detailOccupants = [];
+
+    public function with(): array
+    {
+        return [
+            'reservations' => $this->reservations(),
+            'refundReservation' => $this->refundReservation(),
+            'releaseRequest' => $this->releaseRequest(),
+            'refundModes' => ModeOfPayment::query()->orderBy('mode_of_payment_id')->get(),
+        ];
+    }
+
+    public function reservations(): LengthAwarePaginator
+    {
+        $query = Reservation::query()
+            ->with([
+                'guest.address',
+                'details.facility.facilityType',
+                'details.discount',
+                'details.facility.facilityProduct',
+                'details.roomOccupants',
+                'extraGuests',
+                'payments.modeOfPayment',
+                'refundRequests.reviewedBy',
+                'refundRequests.refundModeOfPayment',
+                'refundRequests.refundedBy',
+                'refundRequests.gcashHandoffBy',
+            ]);
+
+        if ($this->statusFilter !== 'All') {
+            $query->where('status', $this->statusFilter);
+        }
+
+        if ($this->dateFrom !== '' || $this->dateTo !== '') {
+        $query->whereHas('details', function ($detailsQuery): void {
+            if ($this->dateFrom !== '') {
+                $detailsQuery->whereDate('check_in_date', '=', $this->dateFrom);
+            }
+
+            if ($this->dateTo !== '') {
+                $detailsQuery->whereDate('check_out_date', '=', $this->dateTo);
+            }
+        });
+    }
+
+        if (trim($this->search) !== '') {
+            $search = '%' . trim($this->search) . '%';
+
+            $query->where(function ($query) use ($search): void {
+                $query->where('r_ref_no', 'like', $search)
+                    ->orWhereHas('guest', function ($guestQuery) use ($search): void {
+                        $guestQuery->where('first_name', 'like', $search)
+                            ->orWhere('middle_name', 'like', $search)
+                            ->orWhere('last_name', 'like', $search)
+                            ->orWhereRaw(\App\Support\NameSearch::sql('first_name', 'middle_name', 'last_name'), \App\Support\NameSearch::bindings($search))
+                            ->orWhere('contact_no', 'like', $search)
+                            ->orWhere('email', 'like', $search);
+                    });
+            });
+        }
+
+        $allowedSorts = [
+            'reservation_id',
+            'r_ref_no',
+            'reservation_date',
+            'total_price',
+            'amount_due',
+            'status',
+            'created_at',
+        ];
+
+        $sortField = in_array($this->sortField, $allowedSorts, true) ? $this->sortField : 'reservation_id';
+        $sortDirection = $this->sortDirection === 'asc' ? 'asc' : 'desc';
+
+        $perPage = in_array($this->perPage, [10, 25, 50, 100], true)
+            ? $this->perPage
+            : 10;
+
+        return $query
+            ->orderBy($sortField, $sortDirection)
+            ->paginate($perPage);
+    }
+
+    public function updatedSearch(): void
+    {
+        $this->resetPage();
+    }
+
+    public function updatedStatusFilter(): void
+    {
+        $this->resetPage();
+    }
+
+    public function updatedPerPage(): void
+    {
+        if (! in_array($this->perPage, [10, 25, 50, 100], true)) {
+            $this->perPage = 10;
+        }
+
+        $this->resetPage();
+    }
+
+    public function clearListFilters(): void
+    {
+        $this->search = '';
+        $this->statusFilter = 'Active';
+        $this->sortField = 'reservation_id';
+        $this->sortDirection = 'desc';
+        $this->perPage = 10;
+        $this->dateTo = '';
+        $this->dateFrom ='';
+
+        $this->resetPage();
+    }
+
+    public function sortBy(string $field): void
+    {
+        $allowedSorts = [
+            'reservation_id',
+            'r_ref_no',
+            'reservation_date',
+            'total_price',
+            'amount_due',
+            'status',
+            'created_at',
+        ];
+
+        if (! in_array($field, $allowedSorts, true)) {
+            return;
+        }
+
+        if ($this->sortField === $field) {
+            $this->sortDirection = $this->sortDirection === 'asc' ? 'desc' : 'asc';
+        } else {
+            $this->sortField = $field;
+            $this->sortDirection = 'asc';
+        }
+
+        $this->resetPage();
+    }
+
+    public function beginCancellation(int $reservationId): void
+    {
+        $reservation = Reservation::query()->find($reservationId);
+
+        if ($reservation === null) {
+            session()->flash('error', 'This reservation is no longer available. Refresh the list.');
+
+            return;
+        }
+
+        if ($reservation->status !== 'Active') {
+            session()->flash('error', 'Only active reservations can be cancelled.');
+            return;
+        }
+
+        $this->cancelReservationId = $reservation->reservation_id;
+        $this->cancellationReason = '';
+        $this->resetValidation();
+        $this->showCancelReservationModal = true;
+    }
+
+    public function closeCancellation(): void
+    {
+        $this->showCancelReservationModal = false;
+        $this->cancelReservationId = null;
+        $this->cancellationReason = '';
+        $this->resetValidation();
+    }
+
+    public function cancelReservation(
+        StaffReservationCancellationService $cancellationService,
+    ): void
+    {
+        $validated = $this->validate([
+            'cancelReservationId' => ['required', 'exists:tbl_reservation,reservation_id'],
+            'cancellationReason' => ['required', 'string', 'max:500'],
+        ]);
+
+        try {
+            $cancellationService->cancel(
+                (int) $validated['cancelReservationId'],
+                $validated['cancellationReason'],
+                (int) Auth::id(),
+            );
+        } catch (\InvalidArgumentException $exception) {
+            $this->addError(
+                'cancellationReason',
+                $exception->getMessage(),
+            );
+
+            return;
+        }
+
+        $this->showCancelReservationModal = false;
+        $this->cancelReservationId = null;
+        $this->cancellationReason = '';
+        session()->flash('success', 'Reservation cancelled successfully.');
+    }
+
+    public function releaseRequest(): ?RefundRequest
+    {
+        if ($this->releaseRequestId === null) {
+            return null;
+        }
+
+        return RefundRequest::query()
+            ->with(['reservation.guest'])
+            ->find($this->releaseRequestId);
+    }
+
+    public function refundProofUrl(RefundRequest $refund): ?string
+    {
+        if (blank($refund->refund_proof_path) || ! \Illuminate\Support\Facades\Route::has('refunds.proof')) {
+            return null;
+        }
+
+        return route('refunds.proof', $refund);
+    }
+
+    public function beginRefundRelease(int $refundRequestId): void
+    {
+        $request = RefundRequest::query()->find($refundRequestId);
+
+        if ($request === null || ! $request->isWaitingForRelease()) {
+            session()->flash('error', 'This refund is no longer waiting to be given to the guest. Refresh the list.');
+
+            return;
+        }
+
+        $this->releaseRequestId = (int) $request->refund_request_id;
+        $this->releaseAmount = number_format((float) $request->approved_amount, 2, '.', '');
+        $this->releaseModeId = (string) (ModeOfPayment::query()
+            ->whereRaw('LOWER(mode_of_payment) = ?', ['cash'])
+            ->value('mode_of_payment_id') ?? '');
+        $this->releaseNote = '';
+        $this->releaseContact = '';
+        $this->resetValidation();
+        $this->showReleaseModal = true;
+    }
+
+    public function closeRefundRelease(): void
+    {
+        $this->showReleaseModal = false;
+        $this->releaseRequestId = null;
+        $this->releaseAmount = '';
+        $this->releaseModeId = '';
+        $this->releaseNote = '';
+        $this->releaseContact = '';
+        $this->resetValidation();
+    }
+
+    public function updatedShowReleaseModal(bool $open): void
+    {
+        if (! $open) {
+            $this->closeRefundRelease();
+        }
+    }
+
+    public function isGcashRelease(): bool
+    {
+        return strtolower(trim((string) ModeOfPayment::query()
+            ->whereKey((int) $this->releaseModeId)
+            ->value('mode_of_payment'))) === 'gcash';
+    }
+
+    public function updatedReleaseModeId(): void
+    {
+        // The note and contact number only belong to a GCash refund (they go to the admin).
+        if (! $this->isGcashRelease()) {
+            $this->releaseNote = '';
+            $this->releaseContact = '';
+        }
+
+        $this->resetValidation(['releaseNote', 'releaseContact']);
+    }
+
+    /**
+     * Cash (or any non-GCash mode): the cashier gives the money and it is recorded now.
+     * GCash: the refund goes back to the admin with the cashier's note; the admin sends
+     * the money and records the reference number and proof.
+     */
+    public function releaseRefund(RefundRequestWorkflowService $refunds): void
+    {
+        $isGcash = $this->isGcashRelease();
+
+        $validated = $this->validate([
+            'releaseRequestId' => ['required', 'integer'],
+            'releaseAmount' => ['required', 'numeric', 'min:0.01'],
+            'releaseModeId' => ['required', 'integer', 'exists:tbl_mode_of_payment,mode_of_payment_id'],
+            // GCash: the note and the guest's GCash contact number are both required.
+            'releaseNote' => [$isGcash ? 'required' : 'nullable', 'string', 'max:1000'],
+            'releaseContact' => [$isGcash ? 'required' : 'nullable', 'regex:/^\d{11}$/'],
+        ], [
+            'releaseRequestId.required' => 'This refund is no longer available. Refresh the list.',
+            'releaseAmount.required' => $isGcash ? 'Enter the amount to refund through GCash.' : 'Enter the amount given to the guest.',
+            'releaseAmount.numeric' => 'The amount must be a number.',
+            'releaseAmount.min' => 'The amount must be greater than zero.',
+            'releaseModeId.required' => 'Choose how the refund is given.',
+            'releaseModeId.exists' => 'Choose a valid mode of payment.',
+            'releaseNote.required' => 'Add a note to the admin about this GCash refund.',
+            'releaseNote.max' => 'The note cannot be longer than :max characters.',
+            'releaseContact.required' => 'Enter the guest\'s GCash contact number.',
+            'releaseContact.regex' => 'The contact number must be 11 digits, numbers only.',
+        ]);
+
+        try {
+            if ($isGcash) {
+                $refunds->sendGcashToAdmin(
+                    (int) $validated['releaseRequestId'],
+                    (string) $validated['releaseAmount'],
+                    $validated['releaseNote'] ?? null,
+                    $validated['releaseContact'] ?? null,
+                    (int) Auth::id(),
+                );
+            } else {
+                $refunds->release(
+                    (int) $validated['releaseRequestId'],
+                    (int) $validated['releaseModeId'],
+                    (string) $validated['releaseAmount'],
+                    null,
+                    null,
+                    (int) Auth::id(),
+                );
+            }
+        } catch (\InvalidArgumentException $exception) {
+            $this->addError('releaseRefund', $exception->getMessage());
+
+            return;
+        } catch (\Throwable $exception) {
+            report($exception);
+            $this->addError('releaseRefund', 'The refund could not be recorded. Please refresh and try again.');
+
+            return;
+        }
+
+        $this->closeRefundRelease();
+        session()->flash(
+            'success',
+            $isGcash
+                ? 'GCash refund sent to the admin. They will send it and record the reference number and proof.'
+                : 'Refund recorded. It now reduces revenue.',
+        );
+    }
+
+    /** @return array{can_request: bool, reason: ?string, paid: string, used: int, max: int, next_attempt: int, latest: ?\App\Models\RefundRequest} */
+    public function refundInfo(Reservation $reservation): array
+    {
+        return app(RefundRequestWorkflowService::class)->eligibility($reservation);
+    }
+
+    public function refundReservation(): ?Reservation
+    {
+        if ($this->refundReservationId === null) {
+            return null;
+        }
+
+        return Reservation::query()
+            ->with(['guest', 'details.facility.facilityType', 'payments', 'refundRequests'])
+            ->find($this->refundReservationId);
+    }
+
+    public function beginRefundRequest(int $reservationId): void
+    {
+        $reservation = Reservation::query()
+            ->with(['payments', 'refundRequests'])
+            ->find($reservationId);
+
+        if ($reservation === null) {
+            session()->flash('error', 'This reservation is no longer available. Refresh the list.');
+
+            return;
+        }
+
+        $eligibility = $this->refundInfo($reservation);
+
+        if (! $eligibility['can_request']) {
+            session()->flash('error', (string) $eligibility['reason']);
+
+            return;
+        }
+
+        $this->refundReservationId = (int) $reservation->reservation_id;
+        $this->refundNote = '';
+        $this->resetValidation();
+        $this->showRefundModal = true;
+    }
+
+    public function closeRefundRequest(): void
+    {
+        $this->showRefundModal = false;
+        $this->refundReservationId = null;
+        $this->refundNote = '';
+        $this->resetValidation();
+    }
+
+    public function updatedShowRefundModal(bool $open): void
+    {
+        if (! $open) {
+            $this->closeRefundRequest();
+        }
+    }
+
+    public function submitRefundRequest(RefundRequestWorkflowService $refunds): void
+    {
+        $validated = $this->validate([
+            'refundReservationId' => ['required', 'exists:tbl_reservation,reservation_id'],
+            'refundNote' => ['required', 'string', 'max:1000'],
+        ], [
+            'refundReservationId.required' => 'This reservation is no longer available. Refresh the list.',
+            'refundReservationId.exists' => 'This reservation is no longer available. Refresh the list.',
+            'refundNote.required' => 'Add a note to the admin explaining why this refund is needed.',
+            'refundNote.max' => 'The note cannot be longer than :max characters.',
+        ]);
+
+        try {
+            $refunds->submit(
+                (int) $validated['refundReservationId'],
+                $validated['refundNote'],
+                (int) Auth::id(),
+            );
+        } catch (\InvalidArgumentException $exception) {
+            $this->addError('refundRequest', $exception->getMessage());
+
+            return;
+        }
+
+        $this->closeRefundRequest();
+        session()->flash('success', 'Refund request sent to the admin.');
+    }
+
+    public function openDetailAction(int $reservationDetailId, string $action): void
+    {
+        if (! in_array($action, ['reschedule', 'transfer', 'cancel', 'occupants'], true)) {
+            return;
+        }
+
+        $detail = ReservationDetail::query()
+            ->with(['reservation', 'facility.facilityProduct', 'roomOccupants'])
+            ->find($reservationDetailId);
+
+        if ($detail === null) {
+            session()->flash('error', 'This facility is no longer available. Refresh the list.');
+
+            return;
+        }
+
+        if ($detail->reservation?->status !== 'Active'
+            || in_array((string) $detail->status, ['Cancelled', 'Converted', 'No-show'], true)) {
+            session()->flash('error', 'This reservation facility is no longer editable.');
+
+            return;
+        }
+
+        $this->detailActionId = $reservationDetailId;
+        $this->detailAction = $action;
+        $this->detailCheckInDate = $detail->check_in_date?->toDateString() ?? '';
+        $this->detailCheckOutDate = $detail->check_out_date?->toDateString() ?? '';
+        $this->detailOriginalDays = ($action === 'reschedule' && $detail->check_in_date && $detail->check_out_date)
+            ? (string) app(ReservationFacilityOperationService::class)->stayDays($detail->check_in_date, $detail->check_out_date)
+            : '';
+        $this->detailFacilityProductId = (string) ($detail->facility_product_id ?? '');
+        $this->detailFacilityId = '';
+        $this->detailCancellationReason = '';
+        $this->detailOccupants = $detail->roomOccupants
+            ->map(fn ($occupant): array => [
+                'first_name' => $occupant->first_name,
+                'middle_name' => $occupant->middle_name ?? '',
+                'last_name' => $occupant->last_name,
+            ])
+            ->all();
+        $this->resetValidation();
+        $this->showDetailActionModal = true;
+    }
+
+    public function closeDetailAction(): void
+    {
+        $this->showDetailActionModal = false;
+        $this->detailActionId = null;
+        $this->detailAction = null;
+        $this->detailCheckInDate = '';
+        $this->detailCheckOutDate = '';
+        $this->detailOriginalDays = '';
+        $this->detailFacilityProductId = '';
+        $this->detailFacilityId = '';
+        $this->detailCancellationReason = '';
+        $this->detailOccupants = [];
+        $this->resetValidation();
+    }
+
+    public function updatedDetailCheckInDate(): void
+    {
+        // The stay keeps its original length, so the check-out date follows the check-in date.
+        if ($this->detailAction !== 'reschedule' || $this->detailCheckInDate === '') {
+            return;
+        }
+
+        try {
+            $this->detailCheckOutDate = \Illuminate\Support\Carbon::parse($this->detailCheckInDate)
+                ->addDays((int) $this->detailOriginalDays)
+                ->toDateString();
+        } catch (\Throwable) {
+            $this->detailCheckOutDate = '';
+        }
+    }
+
+    public function updatedDetailFacilityProductId(): void
+    {
+        // A different destination product means the facility must be chosen again.
+        $this->detailFacilityId = '';
+    }
+
+    /** Facilities of the chosen product that are free for this reservation facility's schedule. */
+    public function detailTransferFacilities(): Collection
+    {
+        $productId = (int) $this->detailFacilityProductId;
+
+        if ($this->detailActionId === null || $productId < 1) {
+            return collect();
+        }
+
+        $detail = ReservationDetail::query()->find($this->detailActionId);
+
+        if ($detail === null || ! $detail->check_in_date || ! $detail->check_out_date) {
+            return collect();
+        }
+
+        $rateCode = $detail->getRawOriginal('rate_code');
+
+        if (! is_string($rateCode) || $rateCode === '') {
+            return collect();
+        }
+
+        try {
+            $facilityIds = app(FacilityAvailabilityService::class)->availableFacilityIds(
+                $productId,
+                $rateCode,
+                Carbon::parse($detail->check_in_date)->toDateString(),
+                Carbon::parse($detail->check_out_date)->toDateString(),
+            );
+        } catch (\Throwable) {
+            return collect();
+        }
+
+        return Facility::query()
+            ->whereIn('facility_id', $facilityIds->all())
+            ->get(['facility_id', 'facility_name'])
+            ->sortBy('facility_name', SORT_NATURAL | SORT_FLAG_CASE)
+            ->values();
+    }
+
+    public function detailTransferProducts(): Collection
+    {
+        if ($this->detailActionId === null) {
+            return collect();
+        }
+
+        $detail = ReservationDetail::query()
+            ->with('facility')
+            ->find($this->detailActionId);
+
+        if ($detail?->facility === null) {
+            return collect();
+        }
+
+        return FacilityProduct::query()
+            ->where('facility_type_id', $detail->facility->facility_type_id)
+            ->where('is_active', true)
+            ->orderBy('display_name')
+            ->get();
+    }
+
+    /** @return array<string, string> */
+    protected function messages(): array
+    {
+        $unavailable = 'This reservation is no longer available. Refresh the list.';
+        $facilityUnavailable = 'This facility is no longer available. Refresh the list.';
+
+        return [
+            'cancelReservationId.required' => $unavailable,
+            'cancelReservationId.exists' => $unavailable,
+            'cancellationReason.required' => 'Enter a reason for cancelling this reservation.',
+            'cancellationReason.max' => 'The cancellation reason cannot be longer than :max characters.',
+
+            'detailActionId.required' => $facilityUnavailable,
+            'detailActionId.integer' => $facilityUnavailable,
+            'detailActionId.exists' => $facilityUnavailable,
+            'detailAction.required' => 'Choose what you want to do with this facility.',
+            'detailAction.in' => 'Choose a valid action for this facility.',
+
+            'detailCheckInDate.required' => 'Choose the new check-in or use date.',
+            'detailCheckInDate.date_format' => 'Enter a valid check-in or use date.',
+            'detailCheckInDate.after_or_equal' => 'The new check-in or use date cannot be on a previous date.',
+            'detailCheckOutDate.required' => 'Choose the new check-out or end date.',
+            'detailCheckOutDate.date_format' => 'Enter a valid check-out or end date.',
+            'detailCheckOutDate.after_or_equal' => 'The check-out date cannot be before the check-in date.',
+
+            'detailFacilityProductId.required' => 'Choose the facility to transfer to.',
+            'detailFacilityProductId.integer' => 'Choose a facility from the list.',
+            'detailFacilityProductId.exists' => 'That facility is not available. Choose another one.',
+            'detailFacilityId.required' => 'Choose the facility to assign.',
+            'detailFacilityId.integer' => 'Choose a facility from the list.',
+            'detailFacilityId.exists' => 'That facility is not available. Choose another one.',
+
+            'detailCancellationReason.required' => 'Enter a reason for cancelling this facility.',
+            'detailCancellationReason.max' => 'The cancellation reason cannot be longer than :max characters.',
+
+            'detailOccupants.required' => 'There are no occupants to save for this facility.',
+            'detailOccupants.min' => 'There are no occupants to save for this facility.',
+            'detailOccupants.max' => 'You can save up to :max occupants.',
+            'detailOccupants.*.first_name.required' => "Enter this occupant's first name.",
+            'detailOccupants.*.first_name.max' => 'The first name cannot be longer than :max characters.',
+            'detailOccupants.*.last_name.required' => "Enter this occupant's last name.",
+            'detailOccupants.*.last_name.max' => 'The last name cannot be longer than :max characters.',
+            'detailOccupants.*.middle_name.max' => 'The middle name cannot be longer than :max characters.',
+        ];
+    }
+
+    /** @return array<string, string> */
+    protected function validationAttributes(): array
+    {
+        return [
+            'cancellationReason' => 'cancellation reason',
+            'detailCheckInDate' => 'new check-in date',
+            'detailCheckOutDate' => 'new check-out date',
+            'detailFacilityProductId' => 'facility product',
+            'detailFacilityId' => 'facility',
+            'detailCancellationReason' => 'cancellation reason',
+            'detailOccupants.*.first_name' => 'occupant first name',
+            'detailOccupants.*.middle_name' => 'occupant middle name',
+            'detailOccupants.*.last_name' => 'occupant last name',
+        ];
+    }
+
+    public function saveDetailAction(
+        ReservationFacilityOperationService $operations,
+        RoomOccupantService $occupants,
+    ): void {
+        $rules = [
+            'detailActionId' => ['required', 'integer', 'exists:tbl_reservation_details,reservation_details_id'],
+            'detailAction' => ['required', Rule::in(['reschedule', 'transfer', 'cancel', 'occupants'])],
+        ];
+
+        if ($this->detailAction === 'reschedule') {
+            // The original length comes from the database, never from the form state.
+            $current = ReservationDetail::query()->find((int) $this->detailActionId);
+            $originalDays = ($current?->check_in_date && $current?->check_out_date)
+                ? $operations->stayDays($current->check_in_date, $current->check_out_date)
+                : null;
+
+            $rules['detailCheckInDate'] = ['required', 'date_format:Y-m-d', 'after_or_equal:today'];
+            $rules['detailCheckOutDate'] = [
+                'bail',
+                'required',
+                'date_format:Y-m-d',
+                'after_or_equal:detailCheckInDate',
+                function (string $attribute, mixed $value, \Closure $fail) use ($operations, $originalDays): void {
+                    if (
+                        $originalDays === null
+                        || validator(['d' => $this->detailCheckInDate], ['d' => ['required', 'date_format:Y-m-d']])->fails()
+                    ) {
+                        return; // the other rules report these
+                    }
+
+                    $newDays = $operations->stayDays($this->detailCheckInDate, (string) $value);
+
+                    if ($newDays !== $originalDays) {
+                        $fail($operations->stayLengthMismatchMessage($originalDays, $newDays));
+                    }
+                },
+            ];
+        } elseif ($this->detailAction === 'transfer') {
+            $rules['detailFacilityProductId'] = ['required', 'integer', Rule::exists('tbl_facility_product', 'facility_product_id')->where('is_active', true)];
+            $rules['detailFacilityId'] = ['required', 'integer', 'exists:tbl_facility,facility_id'];
+        } elseif ($this->detailAction === 'cancel') {
+            $rules['detailCancellationReason'] = ['required', 'string', 'max:500'];
+        } elseif ($this->detailAction === 'occupants') {
+            $rules['detailOccupants'] = ['required', 'array', 'min:1', 'max:50'];
+            $rules['detailOccupants.*'] = ['required', 'array'];
+            $rules['detailOccupants.*.first_name'] = ['required', 'string', 'max:50'];
+            $rules['detailOccupants.*.middle_name'] = ['nullable', 'string', 'max:50'];
+            $rules['detailOccupants.*.last_name'] = ['required', 'string', 'max:50'];
+        }
+
+        $this->validate($rules);
+
+        try {
+            match ($this->detailAction) {
+                'reschedule' => $operations->rescheduleDetail(
+                    $this->detailActionId,
+                    $this->detailCheckInDate,
+                    $this->detailCheckOutDate,
+                    (int) Auth::id(),
+                ),
+                'transfer' => $operations->transferDetailToProduct(
+                    $this->detailActionId,
+                    (int) $this->detailFacilityProductId,
+                    (int) Auth::id(),
+                    (int) $this->detailFacilityId,
+                ),
+                'cancel' => $operations->cancelDetail(
+                    $this->detailActionId,
+                    $this->detailCancellationReason,
+                    (int) Auth::id(),
+                ),
+                'occupants' => $occupants->replaceReservationOccupants(
+                    $this->detailActionId,
+                    $this->detailOccupants,
+                    (int) Auth::id(),
+                ),
+                default => null,
+            };
+
+            session()->flash('success', match ($this->detailAction) {
+                'reschedule' => 'Facility schedule updated without changing the other reservation facilities.',
+                'transfer' => 'Facility upgraded/transferred to the selected facility.',
+                'cancel' => 'Facility cancelled. Any paid value was retained as same-transaction credit.',
+                'occupants' => 'Room occupant names updated and audited.',
+                default => 'Reservation facility updated.',
+            });
+            $this->closeDetailAction();
+        } catch (\InvalidArgumentException $exception) {
+            $this->addError('detailAction', $exception->getMessage());
+        } catch (\Throwable $exception) {
+            report($exception);
+            $this->addError('detailAction', 'This facility could not be updated. Refresh the list and try again.');
+        }
+    }
+
+    public function getSortIcon(string $field): string
+    {
+        if ($this->sortField !== $field) {
+            return '↕';
+        }
+
+        return $this->sortDirection === 'asc' ? '↑' : '↓';
+    }
+
+    public function fullName(Guest $guest): string
+    {
+        return trim(implode(' ', array_filter([
+            $guest->first_name,
+            $guest->middle_name,
+            $guest->last_name,
+        ])));
+    }
+
+    public function amountPaid(Reservation $reservation): string
+    {
+        return app(DecimalMoneyService::class)->add(...$reservation->payments
+            ->where('payment_status', 'Verified')
+            ->pluck('amount_paid')
+            ->map(fn (mixed $amount): string => (string) $amount)
+            ->all());
+    }
+
+};
+
+?>
+
+<div class="space-y-6">
+    <x-staff-page-header
+        eyebrow="Cashier operations"
+        title="Reservation Management"
+        description="Create temporary facility holds, review guest schedules, and manage active reservations before booking conversion."
+    >
+        <x-slot:actions>
+            <flux:button href="{{ route('cashier.reservations.create') }}" variant="primary" wire:navigate>
+                New reservation
+            </flux:button>
+            <flux:modal.trigger name="booking-policy">
+                <flux:button type="button" variant="ghost" icon="document-text">
+                    Booking, Cancellation &amp; Refund Policy
+                </flux:button>
+            </flux:modal.trigger>
+            <flux:button
+                :href="route('cashier.dashboard')"
+                wire:navigate
+                variant="ghost"
+            >
+                Back to dashboard
+            </flux:button>
+        </x-slot:actions>
+    </x-staff-page-header>
+
+    <x-toast :message="session('success')" fresh />
+
+    <x-error-toast :messages="session('error')" fresh />
+
+    <flux:card class="overflow-hidden p-0">
+
+            <div class="grid gap-3 border-b border-zinc-200 p-5 md:grid-cols-5 dark:border-zinc-800">
+                    <flux:input
+                        wire:model.live.debounce.300ms="search"
+                        label="Search"
+                        placeholder="Reference, guest"
+                        clearable
+                    />
+
+                    <flux:select wire:model.live="statusFilter" label="Status">
+                        <option value="All">All</option>
+                        <option value="Active">Active</option>
+                        <option value="Cancelled">Cancelled</option>
+                        <option value="Converted">Converted</option>
+                        <option value="No-show">No-show</option>
+                    </flux:select>
+
+                    <flux:input
+                        wire:model.live="dateFrom"
+                        type="date"
+                        label="From"
+                    />
+
+                    <flux:input
+                        wire:model.live="dateTo"
+                        type="date"
+                        label="To"
+                    />
+                    <div class="flex items-end gap-2">
+                    <flux:select wire:model.live="perPage" label="Rows">
+                        <option value="10">10</option>
+                        <option value="25">25</option>
+                        <option value="50">50</option>
+                        <option value="100">100</option>
+                    </flux:select>
+
+                <flux:button type="button" wire:click="clearListFilters" variant="ghost">Clear Filters</flux:button>
+                </div>
+            </div>
+
+
+        <div class="overflow-x-auto" wire:loading.class="opacity-60" wire:target="search,statusFilter,perPage,sortBy,clearListFilters">
+            <table class="w-full min-w-[64rem] text-left text-sm">
+                <thead class="border-b border-brand-border bg-zinc-50 text-xs uppercase tracking-wide text-brand-text-muted dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-400">
+                    <tr>
+                        <th class="w-10 px-3 py-3"><span class="sr-only">Expand</span></th>
+                        <th class="px-4 py-3">
+                            <button
+                                type="button"
+                                wire:click="sortBy('r_ref_no')"
+                                class="font-semibold transition hover:text-brand-primary dark:hover:text-white"
+                            >
+                                REF {{ $this->getSortIcon('r_ref_no') }}
+                            </button>
+                        </th>
+                        <th class="px-4 py-3 font-semibold">GUEST</th>
+                        <th class="px-4 py-3 font-semibold">FACILITY</th>
+                        <th class="px-4 py-3 font-semibold">SCHEDULE</th>
+                        <th class="px-4 py-3">
+                            <button
+                                type="button"
+                                wire:click="sortBy('total_price')"
+                                class="font-semibold transition hover:text-brand-primary dark:hover:text-white"
+                            >
+                                TOTAL {{ $this->getSortIcon('total_price') }}
+                            </button>
+                        </th>
+                        <th class="px-4 py-3">
+                            <button
+                                type="button"
+                                wire:click="sortBy('amount_due')"
+                                class="font-semibold transition hover:text-brand-primary dark:hover:text-white"
+                            >
+                                BALANCE {{ $this->getSortIcon('amount_due') }}
+                            </button>
+                        </th>
+                        <th class="px-4 py-3">
+                            <button
+                                type="button"
+                                wire:click="sortBy('status')"
+                                class="font-semibold transition hover:text-brand-primary dark:hover:text-white"
+                            >
+                                STATUS {{ $this->getSortIcon('status') }}
+                            </button>
+                        </th>
+                        <th class="px-4 py-3 text-right font-semibold">Actions</th>
+                    </tr>
+                </thead>
+                @forelse ($reservations as $reservation)
+                    @php
+                        $details = $reservation->details;
+                        $firstDetail = $details->first();
+                        $extraFacilities = max($details->count() - 1, 0);
+                        $rangeStart = $details->min('check_in_date');
+                        $rangeEnd = $details->max('check_out_date');
+                    @endphp
+                    <tbody
+                        wire:key="reservation-row-{{ $reservation->reservation_id }}"
+                        x-data="{ open: false }"
+                        class="border-b border-brand-border dark:border-zinc-800"
+                    >
+                        <tr
+                            @click="open = ! open"
+                            class="cursor-pointer transition hover:bg-brand-surface-muted/70 dark:hover:bg-zinc-800/50"
+                        >
+                            <td class="px-3 py-3 text-brand-text-muted dark:text-zinc-400">
+                                <flux:icon.chevron-right class="size-4 transition-transform" x-bind:class="open && 'rotate-90'" />
+                            </td>
+                            <td class="px-4 py-3 font-medium text-brand-text dark:text-white">{{ $reservation->r_ref_no }}</td>
+                            <td class="px-4 py-3">
+                                <div class="font-medium text-brand-text dark:text-white">{{ $this->fullName($reservation->guest) }}</div>
+                            </td>
+                            <td class="px-4 py-3">
+                                @if ($firstDetail)
+                                    <span class="font-medium text-brand-text dark:text-white">{{ $firstDetail->facility?->facility_name ?? 'Unassigned facility' }}</span>
+                                    @if ($extraFacilities > 0)
+                                        <span class="ml-1 rounded-full bg-zinc-100 px-2 py-0.5 text-xs text-brand-text-muted dark:bg-zinc-800 dark:text-zinc-300">+{{ $extraFacilities }} more</span>
+                                    @endif
+                                @else
+                                    <span class="text-brand-text-muted dark:text-zinc-400">No facility details</span>
+                                @endif
+                            </td>
+                            <td class="whitespace-nowrap px-4 py-3">
+                                @if ($rangeStart)
+                                    {{ $rangeStart->format('M d, Y') }} → {{ $rangeEnd?->format('M d, Y') }}
+                                @endif
+                            </td>
+                            <td class="px-4 py-3">₱{{ number_format((float) $reservation->total_price, 2) }}</td>
+                            <td class="px-4 py-3">₱{{ number_format((float) $reservation->amount_due, 2) }}</td>
+                            <td class="px-4 py-3">
+                                <x-status-badge :status="(string) $reservation->status" />
+                            </td>
+                            <td class="px-4 py-3 text-right" @click.stop>
+                                @if ($reservation->status === 'Active')
+                                    <flux:button size="sm" variant="danger" icon="x-circle" type="button" wire:click="beginCancellation({{ $reservation->reservation_id }})">
+                                        Cancel Entire Reservation
+                                    </flux:button>
+                                @elseif ($reservation->status === 'Cancelled')
+                                    @php($refund = $this->refundInfo($reservation))
+                                    @if ($refund['can_request'])
+                                        <flux:button size="sm" variant="primary" icon="arrow-uturn-left" type="button" wire:click="beginRefundRequest({{ $reservation->reservation_id }})">
+                                            Request refund @if ($refund['used'] > 0)(attempt {{ $refund['next_attempt'] }} of {{ $refund['max'] }})@endif
+                                        </flux:button>
+                                    @elseif ($refund['latest'] && $refund['latest']->isWaitingForRelease())
+                                        <flux:button size="sm" variant="primary" icon="banknotes" type="button" wire:click="beginRefundRelease({{ $refund['latest']->refund_request_id }})">
+                                            Give refund
+                                        </flux:button>
+                                    @elseif ($refund['latest'] && $refund['latest']->isAwaitingAdminGcash())
+                                        <flux:badge size="sm" color="amber">GCash refund with admin</flux:badge>
+                                    @elseif ($refund['latest'] && $refund['latest']->isGivenToGuest())
+                                        <flux:badge size="sm" color="{{ \App\Support\StatusColor::for('Refunded') }}">Refunded</flux:badge>
+                                    @elseif ($refund['latest'])
+                                        <flux:badge size="sm" color="{{ \App\Support\StatusColor::for((string) $refund['latest']->status) }}">
+                                            Refund {{ strtolower((string) $refund['latest']->status) }}
+                                        </flux:badge>
+                                    @else
+                                        <span class="text-xs text-brand-text-muted dark:text-zinc-400">No refund due</span>
+                                    @endif
+                                @else
+                                    <span class="text-xs text-brand-text-muted dark:text-zinc-400">No parent action</span>
+                                @endif
+                            </td>
+                        </tr>
+                        <tr x-show="open" x-transition.opacity style="display: none" class="bg-zinc-50/60 dark:bg-zinc-950/40">
+                            <td colspan="9" class="px-6 py-4">
+                                <div class="mb-3 grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
+                                    <div>
+                                        <div class="text-xs uppercase tracking-wide text-brand-text-muted dark:text-zinc-400">Contact</div>
+                                        <div class="text-brand-text dark:text-white">{{ $reservation->guest->contact_no ?: '—' }}</div>
+                                    </div>
+                                    <div>
+                                        <div class="text-xs uppercase tracking-wide text-brand-text-muted dark:text-zinc-400">Email</div>
+                                        <div class="break-all text-brand-text dark:text-white">{{ $reservation->guest->email ?: '—' }}</div>
+                                    </div>
+                                    <div>
+                                        <div class="text-xs uppercase tracking-wide text-brand-text-muted dark:text-zinc-400">Paid</div>
+                                        <div class="text-brand-text dark:text-white">₱{{ number_format($this->amountPaid($reservation), 2) }}</div>
+                                    </div>
+                                    <div>
+                                        <div class="text-xs uppercase tracking-wide text-brand-text-muted dark:text-zinc-400">Facilities</div>
+                                        <div class="text-brand-text dark:text-white">{{ $details->count() }}</div>
+                                    </div>
+                                </div>
+                                <div class="space-y-3">
+                                    @forelse ($details as $detail)
+                                        <div @class([
+                                            'rounded-lg border p-3',
+                                            'border-red-200 bg-red-50/60 dark:border-red-900 dark:bg-red-950/20' => $detail->status === 'Cancelled',
+                                            'border-zinc-200 dark:border-zinc-700' => $detail->status !== 'Cancelled',
+                                        ])>
+                                            <div class="flex flex-col gap-2 xl:flex-row xl:items-start xl:justify-between">
+                                                <div>
+                                                    <div class="font-medium text-brand-text dark:text-white">
+                                                         {{ $detail->facility?->facility_name ?? 'Unassigned facility' }}
+                                                    </div>
+                                                    <div class="text-xs text-brand-text-muted dark:text-zinc-400">
+                                                        {{ $detail->facility?->facilityType?->facility_type }}
+                                                        · {{ $detail->facility?->facilityProduct?->display_name }}
+                                                        · {{ $detail->rate_type }}
+                                                        · {{ $detail->check_in_date?->format('M d, Y') }} → {{ $detail->check_out_date?->format('M d, Y') }}
+                                                        · {{ $detail->status ?? 'Active' }}
+                                                    </div>
+                                                </div>
+                                                @if ($reservation->status === 'Active' && ! in_array((string) $detail->status, ['Cancelled', 'Converted', 'No-show'], true))
+                                                    <div @click.stop>
+                                                        <x-table-actions label="Actions for reservation facility {{ $detail->reservation_details_id }}">
+                                                            <flux:menu.item icon="calendar-days" wire:click="openDetailAction({{ $detail->reservation_details_id }}, 'reschedule')">Reschedule</flux:menu.item>
+                                                            @if ($detail->roomOccupants->isNotEmpty())
+                                                                <flux:menu.item icon="user-group" wire:click="openDetailAction({{ $detail->reservation_details_id }}, 'occupants')">Occupants</flux:menu.item>
+                                                            @endif
+                                                            <flux:menu.separator />
+                                                            <flux:menu.item icon="x-circle" variant="danger" wire:click="openDetailAction({{ $detail->reservation_details_id }}, 'cancel')">Cancel facility</flux:menu.item>
+                                                        </x-table-actions>
+                                                    </div>
+                                                @endif
+                                            </div>
+                                        </div>
+                                    @empty
+                                        <span class="text-brand-text-muted dark:text-zinc-400">No facility details</span>
+                                    @endforelse
+                                </div>
+
+                                @if ($reservation->status === 'Cancelled')
+                                    @php($refund = $this->refundInfo($reservation))
+                                    <div class="mt-4 space-y-3 rounded-lg border border-zinc-200 p-4 text-sm dark:border-zinc-700">
+                                        <div>
+                                            <div class="text-xs uppercase tracking-wide text-brand-text-muted dark:text-zinc-400">Cancellation</div>
+                                            <div class="text-brand-text dark:text-white">
+                                                {{ $reservation->cancelled_at?->format('M d, Y') }} · {{ $reservation->cancellation_reason ?: 'No reason recorded' }}
+                                            </div>
+                                        </div>
+
+                                        <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                                            <div>
+                                                <div class="text-xs uppercase tracking-wide text-brand-text-muted dark:text-zinc-400">Refund</div>
+                                                <div class="text-brand-text dark:text-white">
+                                                    Verified payments ₱{{ number_format((float) $refund['paid'], 2) }} · {{ $refund['used'] }} of {{ $refund['max'] }} requests used
+                                                </div>
+                                            </div>
+
+                                            @if ($refund['can_request'])
+                                                <flux:button size="sm" variant="primary" icon="arrow-uturn-left" type="button" wire:click="beginRefundRequest({{ $reservation->reservation_id }})">
+                                                    Request refund
+                                                </flux:button>
+                                            @else
+                                                <span class="text-xs text-brand-text-muted dark:text-zinc-400">{{ $refund['reason'] }}</span>
+                                            @endif
+                                        </div>
+
+                                        @foreach ($reservation->refundRequests as $request)
+                                            <div wire:key="refund-{{ $request->refund_request_id }}" class="rounded-lg bg-zinc-50 p-3 dark:bg-zinc-900/60">
+                                                <div class="flex flex-wrap items-center gap-2">
+                                                    <span class="font-medium text-brand-text dark:text-white">Attempt {{ $request->attempt_no }}</span>
+                                                    <flux:badge size="sm" color="{{ \App\Support\StatusColor::for((string) $request->status) }}">{{ $request->status }}</flux:badge>
+                                                    <span class="text-xs text-brand-text-muted dark:text-zinc-400">{{ $request->created_at?->format('M d, Y h:i A') }}</span>
+                                                </div>
+                                                <div class="mt-1 text-brand-text dark:text-zinc-200">
+                                                    Requested ₱{{ number_format((float) $request->requested_amount, 2) }}
+                                                    @if ($request->status === 'Approved')
+                                                        · <span class="font-medium">Admin approved ₱{{ number_format((float) $request->approved_amount, 2) }}.</span>
+                                                    @endif
+                                                </div>
+                                                @if ($request->isWaitingForRelease())
+                                                    <div class="mt-2 flex flex-wrap items-center gap-3">
+                                                        <span class="text-xs text-brand-text-muted dark:text-zinc-400">Give the guest the money, then record how you paid it.</span>
+                                                        <flux:button size="sm" variant="primary" icon="banknotes" type="button" wire:click="beginRefundRelease({{ $request->refund_request_id }})">
+                                                            Give refund to guest
+                                                        </flux:button>
+                                                    </div>
+                                                @elseif ($request->isAwaitingAdminGcash())
+                                                    <div class="mt-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-100">
+                                                        <span class="font-medium">Sent to admin for GCash</span>
+                                                        · ₱{{ number_format((float) $request->gcash_handoff_amount, 2) }}
+                                                        · {{ $request->gcash_handoff_at?->format('M d, Y h:i A') }}
+                                                        @if ($request->gcashHandoffBy)
+                                                            by {{ $request->gcashHandoffBy->full_name }}
+                                                        @endif
+                                                        <div class="text-xs">Waiting for the admin to send the money and add the reference number and proof.</div>
+                                                        @if ($request->gcash_handoff_contact_number)
+                                                            <div class="mt-1 text-xs">GCash number: {{ $request->gcash_handoff_contact_number }}</div>
+                                                        @endif
+                                                        @if ($request->gcash_handoff_note)
+                                                            <div class="mt-1 text-xs">Your note: {{ $request->gcash_handoff_note }}</div>
+                                                        @endif
+                                                    </div>
+                                                @elseif ($request->isGivenToGuest())
+                                                    @php($proofLink = $this->refundProofUrl($request))
+                                                    <div class="mt-1 text-sm text-brand-text dark:text-zinc-200">
+                                                        <span class="font-medium">Refunded ₱{{ number_format((float) $request->refunded_amount, 2) }}</span>
+                                                        via {{ $request->refundModeOfPayment?->mode_of_payment ?? 'Unknown' }}
+                                                        on {{ $request->refunded_at?->format('M d, Y h:i A') }}
+                                                        @if ($request->refundedBy)
+                                                            by {{ $request->refundedBy->full_name }}
+                                                        @endif
+                                                        @if ($request->refund_reference_number)
+                                                            · Ref {{ $request->refund_reference_number }}
+                                                        @endif
+                                                        @if ($proofLink)
+                                                            · <a href="{{ $proofLink }}" target="_blank" rel="noopener" class="font-medium underline">View proof</a>
+                                                        @endif
+                                                    </div>
+                                                    @if ($proofLink)
+                                                        <a href="{{ $proofLink }}" target="_blank" rel="noopener" class="mt-2 block w-fit">
+                                                            <img src="{{ $proofLink }}" alt="GCash refund proof" loading="lazy" class="max-h-40 rounded-lg border border-zinc-200 object-contain dark:border-zinc-700" />
+                                                        </a>
+                                                    @endif
+                                                    @if ($request->gcash_handoff_note)
+                                                        <div class="mt-1 text-xs text-brand-text-muted dark:text-zinc-400">Your note to the admin: {{ $request->gcash_handoff_note }}</div>
+                                                    @endif
+                                                @endif
+                                                @if ($request->request_note)
+                                                    <div class="mt-1 text-xs text-brand-text-muted dark:text-zinc-400">Your note: {{ $request->request_note }}</div>
+                                                @endif
+                                                @if ($request->admin_note)
+                                                    <div class="mt-1 text-xs text-brand-text-muted dark:text-zinc-400">
+                                                        Admin{{ $request->reviewedBy ? ' ('.$request->reviewedBy->full_name.')' : '' }}: {{ $request->admin_note }}
+                                                    </div>
+                                                @endif
+                                            </div>
+                                        @endforeach
+                                    </div>
+                                @endif
+                            </td>
+                        </tr>
+                    </tbody>
+                @empty
+                    <tbody>
+                        <tr>
+                            <td colspan="9" class="px-4 py-8">
+                                <x-dashboard-empty-state
+                                    title="No reservations found"
+                                    description="Try another search term or status, or create a new reservation when the guest is ready."
+                                    class="border-0 bg-transparent py-6 shadow-none dark:bg-transparent"
+                                />
+                            </td>
+                        </tr>
+                    </tbody>
+                @endforelse
+            </table>
+
+
+        </div>
+
+        <div class="border-t border-zinc-200 px-5 py-4 dark:border-zinc-800">
+            {{ $reservations->links() }}
+        </div>
+    </flux:card>
+    {{-- Facility actions: reschedule / transfer / cancel facility / occupants --}}
+    <flux:modal wire:model="showDetailActionModal" class="{{ $detailAction === 'occupants' ? 'md:w-[46rem]' : 'md:w-[34rem]' }}">
+        <div class="space-y-5">
+            <div>
+                <flux:heading size="lg">
+                    @switch($detailAction)
+                        @case('reschedule') Reschedule facility @break
+                        @case('transfer') Upgrade / transfer facility @break
+                        @case('cancel') Cancel facility @break
+                        @case('occupants') Edit room occupants @break
+                    @endswitch
+                </flux:heading>
+                <flux:text class="mt-1">This action changes only the selected facility detail, not the other facilities under the reservation.</flux:text>
+            </div>
+
+            {{-- Service errors and stale-row errors only. Field errors show under their own inputs below. --}}
+            @php($actionError = $errors->first('detailAction') ?: $errors->first('detailActionId') ?: $errors->first('detailOccupants'))
+            @if ($actionError)
+                <div class="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700 dark:border-red-900 dark:bg-red-950/30 dark:text-red-200">{{ $actionError }}</div>
+            @endif
+
+            <form wire:submit="saveDetailAction" novalidate class="space-y-4">
+                @if ($detailAction === 'reschedule')
+                    <div class="grid gap-4 md:grid-cols-2">
+                        <flux:input wire:model.live="detailCheckInDate" type="date" label="New check-in/use date *" />
+                        <div>
+                            <flux:input wire:model="detailCheckOutDate" type="date" readonly label="New check-out/end date *" />
+                            <p class="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+                                Set automatically: @if ((int) $detailOriginalDays === 0) the same day as check-in @else {{ (int) $detailOriginalDays }} {{ (int) $detailOriginalDays === 1 ? 'day' : 'days' }} after check-in @endif, the same length as the original stay.
+                            </p>
+                        </div>
+                    </div>
+
+                @elseif ($detailAction === 'transfer')
+                    <flux:select wire:model.live="detailFacilityProductId" label="Destination facility product *">
+                        <option value="">Choose an upgrade product</option>
+                        @foreach ($this->detailTransferProducts() as $product)
+                            <option value="{{ $product->facility_product_id }}">{{ $product->display_name }}</option>
+                        @endforeach
+                    </flux:select>
+                    <flux:select wire:model="detailFacilityId" label="Facility *">
+                        <option value="">Choose a facility</option>
+                        @foreach ($this->detailTransferFacilities() as $transferFacility)
+                            <option value="{{ $transferFacility->facility_id }}">{{ $transferFacility->facility_name }}</option>
+                        @endforeach
+                    </flux:select>
+                    @if ($detailFacilityProductId !== '' && $this->detailTransferFacilities()->isEmpty())
+                        <p class="text-xs text-amber-700 dark:text-amber-300">No facility of this product is free for this reservation's schedule.</p>
+                    @endif
+                    <p class="text-xs text-zinc-500">Choose the exact facility to assign. Cheaper/downgrade transfers are rejected by the service.</p>
+                @elseif ($detailAction === 'cancel')
+                    <flux:textarea wire:model="detailCancellationReason" label="Cancellation reason *" rows="3" />
+                    <p class="text-xs text-zinc-500">Paid value remains as same-transaction credit and is not refunded or moved to another booking.</p>
+                @elseif ($detailAction === 'occupants')
+                    <div class="max-h-[55vh] space-y-3 overflow-y-auto pr-1">
+                        @forelse ($detailOccupants as $index => $occupant)
+                            <div class="grid gap-3 md:grid-cols-3" wire:key="detail-occupant-{{ $index }}">
+                                <flux:input wire:model="detailOccupants.{{ $index }}.first_name" label="Occupant {{ $index + 1 }} first name *" />
+                                <flux:input wire:model="detailOccupants.{{ $index }}.middle_name" label="Middle name" />
+                                <flux:input wire:model="detailOccupants.{{ $index }}.last_name" label="Last name *" />
+                            </div>
+                        @empty
+                            <p class="text-sm text-zinc-500">This facility has no room occupant list.</p>
+                        @endforelse
+                    </div>
+                @endif
+
+                <div class="flex justify-end gap-3">
+                    <flux:button type="button" variant="ghost" wire:click="closeDetailAction">Cancel</flux:button>
+                    <flux:button type="submit" variant="{{ $detailAction === 'cancel' ? 'danger' : 'primary' }}">
+                        Save
+                    </flux:button>
+                </div>
+            </form>
+        </div>
+    </flux:modal>
+
+    {{-- Cancel whole reservation --}}
+    <flux:modal wire:model="showCancelReservationModal" class="md:w-[30rem]">
+        <form wire:submit="cancelReservation" novalidate class="space-y-5">
+            <div>
+                <flux:heading size="lg">Cancel reservation</flux:heading>
+                <flux:text class="mt-1">Provide a reason. This cancels the whole reservation.</flux:text>
+            </div>
+
+            @error('cancelReservationId')
+                <div class="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700 dark:border-red-900 dark:bg-red-950/30 dark:text-red-200">{{ $message }}</div>
+            @enderror
+
+            <flux:field class="relative">
+                <flux:label>Cancellation reason <span class="text-red-500">*</span></flux:label>
+                <flux:input wire:model="cancellationReason" :invalid="$errors->has('cancellationReason')" />
+                @if ($msg = $this->visibleError('cancellationReason'))
+                    <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $msg }}</p>
+                @endif
+            </flux:field>
+
+            <div class="flex justify-end gap-3">
+                <flux:button type="button" variant="ghost" wire:click="closeCancellation">Close</flux:button>
+                <flux:button type="submit" variant="danger">Confirm cancellation</flux:button>
+            </div>
+        </form>
+    </flux:modal>
+
+    {{-- Request a refund for a cancelled reservation --}}
+    <flux:modal wire:model="showRefundModal" class="w-full max-h-[90vh] overflow-y-auto md:w-[36rem]">
+        @if ($refundReservation)
+            @php($refundInfo = $this->refundInfo($refundReservation))
+            <form wire:submit="submitRefundRequest" novalidate class="space-y-5">
+                <div class="pe-8">
+                    <flux:heading size="lg">Request a refund</flux:heading>
+                    <flux:text class="mt-1">
+                        The admin receives this together with the reservation details and the cancellation reason.
+                        Attempt {{ $refundInfo['next_attempt'] }} of {{ $refundInfo['max'] }}.
+                    </flux:text>
+                </div>
+
+                @error('refundRequest')
+                    <div class="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700 dark:border-red-900 dark:bg-red-950/30 dark:text-red-200">{{ $message }}</div>
+                @enderror
+                @error('refundReservationId')
+                    <div class="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700 dark:border-red-900 dark:bg-red-950/30 dark:text-red-200">{{ $message }}</div>
+                @enderror
+
+                <div class="space-y-2 rounded-lg border border-zinc-200 p-4 text-sm dark:border-zinc-700">
+                    <div class="flex justify-between gap-4"><span class="text-zinc-500">Reservation</span><span class="font-medium">{{ $refundReservation->r_ref_no }}</span></div>
+                    <div class="flex justify-between gap-4"><span class="text-zinc-500">Guest</span><span class="text-right font-medium">{{ $this->fullName($refundReservation->guest) }}</span></div>
+                    <div class="flex justify-between gap-4"><span class="text-zinc-500">Contact</span><span>{{ $refundReservation->guest->contact_no ?: '—' }}</span></div>
+                    <div class="flex justify-between gap-4">
+                        <span class="text-zinc-500">Facilities</span>
+                        <span class="text-right">
+                            @foreach ($refundReservation->details as $detail)
+                                <span class="block">{{ $detail->facility?->facility_name ?? 'Unassigned facility' }} · {{ $detail->check_in_date?->format('M d, Y') }} → {{ $detail->check_out_date?->format('M d, Y') }}</span>
+                            @endforeach
+                        </span>
+                    </div>
+                    <div class="flex justify-between gap-4"><span class="text-zinc-500">Total price</span><span>₱{{ number_format((float) $refundReservation->total_price, 2) }}</span></div>
+                    <div class="flex justify-between gap-4"><span class="text-zinc-500">Verified payments</span><span class="font-medium">₱{{ number_format((float) $refundInfo['paid'], 2) }}</span></div>
+                    <div class="flex justify-between gap-4"><span class="text-zinc-500">Cancelled on</span><span>{{ $refundReservation->cancelled_at?->format('M d, Y') }}</span></div>
+                    <div>
+                        <div class="text-zinc-500">Cancellation reason</div>
+                        <div class="mt-0.5">{{ $refundReservation->cancellation_reason ?: 'No reason recorded' }}</div>
+                    </div>
+                </div>
+
+                <flux:text class="text-sm">
+                    The request covers what the guest paid (₱{{ number_format((float) $refundInfo['paid'], 2) }}). The admin decides how much to approve.
+                </flux:text>
+
+                <flux:field class="relative">
+                    <flux:label>Note to the admin <span class="text-red-500">*</span></flux:label>
+                    <flux:textarea wire:model="refundNote" rows="3" placeholder="Explain this case, for example why the guest should be refunded." :invalid="$errors->has('refundNote')" />
+                    @error('refundNote')
+                        <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $message }}</p>
+                    @enderror
+                </flux:field>
+
+                <details class="rounded-lg border border-zinc-200 p-3 text-sm dark:border-zinc-700">
+                    <summary class="cursor-pointer font-medium">Booking, Cancellation, and Refund Policy</summary>
+                    <x-booking-policy-content class="mt-3 max-h-64 overflow-y-auto pr-1" />
+                </details>
+
+                <div class="flex justify-end gap-3">
+                    <flux:button type="button" variant="ghost" wire:click="closeRefundRequest">Close</flux:button>
+                    <flux:button type="submit" variant="primary">Send to admin</flux:button>
+                </div>
+            </form>
+        @endif
+    </flux:modal>
+    {{-- Give an approved refund back to the guest --}}
+    <flux:modal wire:model="showReleaseModal" class="w-full max-h-[90vh] overflow-y-auto md:w-[34rem]">
+        @if ($releaseRequest)
+            <form wire:submit="releaseRefund" novalidate class="space-y-5">
+                <div class="pe-8">
+                    <flux:heading size="lg">Give refund to guest</flux:heading>
+                    <flux:text class="mt-1">
+                        @if ($this->isGcashRelease())
+                            GCash refunds are sent by the admin. Add a note and send it back; the admin will send the money and add the reference number and proof.
+                        @else
+                            Record how the approved refund is given back. It reduces revenue from today.
+                        @endif
+                    </flux:text>
+                </div>
+
+                @error('releaseRefund')
+                    <div class="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700 dark:border-red-900 dark:bg-red-950/30 dark:text-red-200">{{ $message }}</div>
+                @enderror
+                @error('releaseRequestId')
+                    <div class="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700 dark:border-red-900 dark:bg-red-950/30 dark:text-red-200">{{ $message }}</div>
+                @enderror
+
+                <div class="space-y-2 rounded-lg border border-zinc-200 p-4 text-sm dark:border-zinc-700">
+                    <div class="flex justify-between gap-4"><span class="text-zinc-500">Reservation</span><span class="font-medium">{{ $releaseRequest->reservation?->r_ref_no }}</span></div>
+                    <div class="flex justify-between gap-4"><span class="text-zinc-500">Guest</span><span class="text-right font-medium">{{ $releaseRequest->reservation?->guest ? $this->fullName($releaseRequest->reservation->guest) : '—' }}</span></div>
+                    <div class="flex justify-between gap-4"><span class="text-zinc-500">Approved by admin</span><span class="font-medium">₱{{ number_format((float) $releaseRequest->approved_amount, 2) }}</span></div>
+                </div>
+
+                <flux:field class="relative">
+                    <flux:label>{{ $this->isGcashRelease() ? 'Amount to refund through GCash' : 'Amount given' }} <span class="text-red-500">*</span></flux:label>
+                    <flux:input wire:model="releaseAmount" type="number" step="0.01" min="0.01" max="{{ $releaseRequest->approved_amount }}" :invalid="$errors->has('releaseAmount')" />
+                    <flux:text class="text-xs">Up to ₱{{ number_format((float) $releaseRequest->approved_amount, 2) }}.</flux:text>
+                    @if ($msg = $this->visibleError('releaseAmount'))
+                        <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $msg }}</p>
+                    @endif
+                </flux:field>
+
+                <flux:field class="relative">
+                    <flux:label>Mode of payment <span class="text-red-500">*</span></flux:label>
+                    <flux:select wire:model.live="releaseModeId" :invalid="$errors->has('releaseModeId')">
+                        @foreach ($refundModes as $mode)
+                            <option value="{{ $mode->mode_of_payment_id }}">{{ $mode->mode_of_payment }}</option>
+                        @endforeach
+                    </flux:select>
+                    @if ($msg = $this->visibleError('releaseModeId'))
+                        <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $msg }}</p>
+                    @endif
+                </flux:field>
+
+                @if ($this->isGcashRelease())
+                    <flux:field class="relative">
+                        <flux:label>GCash contact number <span class="text-red-500">*</span></flux:label>
+                        <flux:input
+                            wire:model="releaseContact"
+                            type="text"
+                            inputmode="numeric"
+                            pattern="[0-9]*"
+                            maxlength="11"
+                            placeholder="09XXXXXXXXX"
+                            x-on:input="$el.value = $el.value.replace(/\D/g, '')"
+                            :invalid="$errors->has('releaseContact')"
+                        />
+                        <flux:text class="text-xs">The guest's GCash number the admin will send the refund to. Numbers only.</flux:text>
+                        @error('releaseContact')
+                            <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $message }}</p>
+                        @enderror
+                    </flux:field>
+
+                    <flux:field class="relative">
+                        <flux:label>Note to admin <span class="text-red-500">*</span></flux:label>
+                        <flux:textarea wire:model="releaseNote" rows="3" placeholder="Explain this GCash refund to the admin." :invalid="$errors->has('releaseNote')" />
+                        @error('releaseNote')
+                            <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $message }}</p>
+                        @enderror
+                    </flux:field>
+                @endif
+
+                <details class="rounded-lg border border-zinc-200 p-3 text-sm dark:border-zinc-700">
+                    <summary class="cursor-pointer font-medium">Booking, Cancellation, and Refund Policy</summary>
+                    <x-booking-policy-content class="mt-3 max-h-64 overflow-y-auto pr-1" />
+                </details>
+
+                <div class="flex justify-end gap-3">
+                    <flux:button type="button" variant="ghost" wire:click="closeRefundRelease">Close</flux:button>
+                    <flux:button type="submit" variant="primary" wire:loading.attr="disabled" wire:target="releaseRefund">{{ $this->isGcashRelease() ? 'Send to admin' : 'Record refund' }}</flux:button>
+                </div>
+            </form>
+        @endif
+    </flux:modal>
+    {{-- Booking, Cancellation, and Refund Policy (the cashier handles refunds here) --}}
+    <flux:modal name="booking-policy" class="w-full max-h-[90vh] overflow-y-auto md:w-[40rem]">
+        <div class="space-y-5">
+            <div class="pe-8">
+                <flux:heading size="lg">Booking, Cancellation, and Refund Policy</flux:heading>
+                <flux:text class="mt-1">Olaer Spring Resort. Use this when handling cancellations and refund requests.</flux:text>
+            </div>
+
+            <x-booking-policy-content />
+
+            <div class="flex justify-end">
+                <flux:modal.close>
+                    <flux:button type="button" variant="ghost">Close</flux:button>
+                </flux:modal.close>
+            </div>
+        </div>
+    </flux:modal>
+</div>

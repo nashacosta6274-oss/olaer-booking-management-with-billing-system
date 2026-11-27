@@ -1,0 +1,1202 @@
+<?php
+
+use App\Models\Amenity;
+use App\Models\AmenityRequest;
+use App\Models\Booking;
+use App\Models\AmenityRequestPhoto;
+use App\Models\BookingDetail;
+use App\Services\AmenityDeliveryPhotoService;
+use App\Services\AmenityRequestWorkflowService;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Validation\ValidationException;
+use Livewire\Attributes\Layout;
+use Livewire\Attributes\Title;
+use Livewire\Attributes\Url;
+use Livewire\Volt\Component;
+use Livewire\WithFileUploads;
+use Livewire\WithPagination;
+
+new #[Layout('layouts.app')] #[Title('Maintenance Amenity Requests - Olaer Spring Resort')] class extends Component
+{
+
+    public function updated(string $property): void
+    {
+        // Clear the red highlight of a field as soon as the user edits it.
+        $this->resetValidation($property);
+
+        // Quantity accepts whole numbers of at least 1 only (a blank stays blank while typing).
+        if (preg_match('/^items\.(\d+)\.quantity$/', $property, $match) && isset($this->items[(int) $match[1]])) {
+            $digits = substr(preg_replace('/\D/', '', (string) ($this->items[(int) $match[1]]['quantity'] ?? '')), 0, 6);
+
+            $this->items[(int) $match[1]]['quantity'] = $digits === '' ? '' : max(1, (int) $digits);
+        }
+    }
+
+    /** Error text for a required field; an empty required field only turns red (no text). */
+    public function visibleError(string $field): ?string
+    {
+        $message = $this->getErrorBag()->first($field);
+
+        if ($message === '') {
+            return null;
+        }
+
+        $value = data_get($this, $field);
+
+        return $value === null || $value === '' || $value === [] ? null : $message;
+    }
+    use WithFileUploads;
+    use WithPagination;
+
+    #[Url(as: 'q', except: '')]
+    public string $search = '';
+
+    #[Url(as: 'status', except: 'Pending')]
+    public string $statusFilter = 'Pending';
+
+    #[Url(as: 'assignment', except: 'unassigned')]
+    public string $assignmentFilter = 'unassigned';
+
+    #[Url(as: 'sort', except: 'amenity_request_id')]
+    public string $sortField = 'amenity_request_id';
+
+    #[Url(as: 'direction', except: 'desc')]
+    public string $sortDirection = 'desc';
+
+    #[Url(as: 'per_page', except: 10)]
+    public int $perPage = 10;
+
+    public bool $showCreateForm = false;
+    public ?int $pendingActionRequestId = null;
+    public ?string $pendingAction = null;
+    public bool $showActionDialog = false;
+
+    /** Proof-of-delivery photos picked in the confirm dialog; saved right away. */
+    public array $photos = [];
+
+    /** One file at a time: the bucket (S3) upload driver does not accept multiple files. */
+    public $photo = null;
+
+    public array $form = [
+        'booking_id' => '',
+        'booking_detail_id' => '',
+    ];
+
+    public array $items = [
+        ['amenity_id' => '', 'quantity' => 1],
+    ];
+
+    public function mount(): void
+    {
+        $this->showCreateForm = request()->routeIs(
+            'maintenance.create-amenity-request.index',
+        );
+    }
+
+    public function with(): array
+    {
+        return [
+            'requests' => $this->requests(),
+            'checkedInBookings' => $this->checkedInBookings(),
+            'selectedBookingDetails' =>
+                $this->selectedBookingDetails(),
+            'rentableAmenities' => $this->rentableAmenities(),
+            'currentTotal' => $this->calculateTotal($this->items),
+            'dialogPhotos' => $this->dialogPhotos(),
+        ];
+    }
+
+    public function updatedSearch(): void
+    {
+        $this->resetPage();
+    }
+
+    public function updatedStatusFilter(): void
+    {
+        $this->resetPage();
+    }
+
+    public function updatedAssignmentFilter(): void
+    {
+        $this->resetPage();
+    }
+
+    public function updatedFormBookingId(): void
+    {
+        $this->form['booking_detail_id'] = '';
+    }
+
+    public function updatedPerPage(): void
+    {
+        if (! in_array($this->perPage, [10, 25, 50, 100], true)) {
+            $this->perPage = 10;
+        }
+
+        $this->resetPage();
+    }
+
+    public function clearFilters(): void
+    {
+        $this->search = '';
+        $this->statusFilter = '';
+        $this->assignmentFilter = '';
+        $this->sortField = 'amenity_request_id';
+        $this->sortDirection = 'desc';
+        $this->perPage = 10;
+
+        $this->resetPage();
+    }
+
+    public function toggleCreateForm(): void
+    {
+        $this->showCreateForm = ! $this->showCreateForm;
+    }
+
+    public function addItem(): void
+    {
+        $this->items[] = [
+            'amenity_id' => '',
+            'quantity' => 1,
+        ];
+    }
+
+    public function removeItem(int $index): void
+    {
+        unset($this->items[$index]);
+        $this->items = array_values($this->items);
+
+        if ($this->items === []) {
+            $this->addItem();
+        }
+    }
+
+    public function createRequest(
+        AmenityRequestWorkflowService $workflow,
+    ): void {
+        $validated = $this->validate([
+            'form.booking_id' => [
+                'required',
+                'integer',
+                'exists:tbl_booking,booking_id',
+            ],
+            'form.booking_detail_id' => [
+                'required',
+                'integer',
+                'exists:tbl_booking_details,booking_details_id',
+            ],
+            'items' => ['required', 'array', 'min:1'],
+            'items.*.amenity_id' => [
+                'required',
+                'integer',
+                'exists:tbl_amenity,amenity_id',
+                'distinct',
+            ],
+            'items.*.quantity' => [
+                'required',
+                'integer',
+                'min:1',
+            ],
+        ], [
+            'items.*.amenity_id.distinct' => 'Each amenity can only be added once. Raise its quantity instead.',
+            'items.*.quantity.required' => 'Enter a quantity (at least 1).',
+            'items.*.quantity.integer' => 'Quantity must be a whole number.',
+            'items.*.quantity.min' => 'Quantity must be at least 1.',
+        ]);
+
+        try {
+            $workflow->createBillableRequest([
+                'booking_id' =>
+                    (int) $validated['form']['booking_id'],
+                'booking_detail_id' =>
+                    (int) $validated['form']['booking_detail_id'],
+                'user_id' => (int) Auth::id(),
+                'items' => $validated['items'],
+            ]);
+
+            $this->resetCreateForm();
+            $this->showCreateForm = false;
+            $this->resetPage();
+
+            session()->flash(
+                'success',
+                'Amenity request created and assigned to you for delivery. The charge remains payable during final billing.',
+            );
+        } catch (\Throwable $exception) {
+            $this->addError('request', $exception->getMessage());
+        }
+    }
+
+    public function sortBy(string $field): void
+    {
+        $allowed = [
+            'amenity_request_id',
+            'date_created',
+            'total_price',
+            'amenity_request_status',
+            'delivered_at',
+        ];
+
+        if (! in_array($field, $allowed, true)) {
+            return;
+        }
+
+        if ($this->sortField === $field) {
+            $this->sortDirection =
+                $this->sortDirection === 'asc' ? 'desc' : 'asc';
+        } else {
+            $this->sortField = $field;
+            $this->sortDirection =
+                $field === 'amenity_request_id' ? 'desc' : 'asc';
+        }
+
+        $this->resetPage();
+    }
+
+    public function requestAction(string $action, int $amenityRequestId): void
+    {
+        if (! in_array($action, ['accept', 'deliver'], true)) {
+            return;
+        }
+
+        AmenityRequest::query()->findOrFail($amenityRequestId);
+        $this->photos = [];
+        $this->resetErrorBag(['photos', 'photos.*']);
+        $this->pendingAction = $action;
+        $this->pendingActionRequestId = $amenityRequestId;
+        $this->showActionDialog = true;
+    }
+
+    public function confirmAction(AmenityRequestWorkflowService $workflow): void
+    {
+        if ($this->pendingActionRequestId === null || $this->pendingAction === null) {
+            return;
+        }
+
+        // Delivery needs at least one proof photo; keep the dialog open until there is one.
+        if (
+            $this->pendingAction === 'deliver'
+            && ! AmenityRequestPhoto::query()
+                ->where('amenity_request_id', $this->pendingActionRequestId)
+                ->exists()
+        ) {
+            $this->addError('photos', 'Upload at least one proof-of-delivery photo before marking this request as delivered.');
+
+            return;
+        }
+
+        $requestId = $this->pendingActionRequestId;
+        $action = $this->pendingAction;
+        $this->showActionDialog = false;
+        $this->pendingActionRequestId = null;
+        $this->pendingAction = null;
+
+        if ($action === 'accept') {
+            $this->acceptRequest($requestId, $workflow);
+
+            return;
+        }
+
+        $this->markDelivered($requestId, $workflow);
+    }
+
+    public function updatedPhoto(AmenityDeliveryPhotoService $photoService): void
+    {
+        if ($this->photo === null) {
+            return;
+        }
+
+        $this->photos = [$this->photo];
+        $this->photo = null;
+
+        $this->updatedPhotos($photoService);
+    }
+
+    /** Save proof photos as soon as they are chosen (max 10 per request, 64 MB each). */
+    public function updatedPhotos(AmenityDeliveryPhotoService $photoService): void
+    {
+        $this->resetErrorBag(['photos', 'photos.*']);
+
+        if ($this->pendingActionRequestId === null || $this->pendingAction !== 'deliver' || $this->photos === []) {
+            $this->photos = [];
+
+            return;
+        }
+
+        try {
+            $this->validate([
+                'photos' => ['array', 'max:'.AmenityDeliveryPhotoService::MAX_PHOTOS],
+                'photos.*' => [
+                    'file',
+                    'mimes:jpg,jpeg,png,webp',
+                    'max:'.AmenityDeliveryPhotoService::MAX_KILOBYTES,
+                ],
+            ], [
+                'photos.max' => 'Choose up to '.AmenityDeliveryPhotoService::MAX_PHOTOS.' photos at a time.',
+                'photos.*.mimes' => 'Photos must be JPG, PNG or WebP images.',
+                'photos.*.max' => 'Each photo must be 64 MB or smaller.',
+                'photos.*.file' => 'One of the chosen files could not be uploaded.',
+            ]);
+
+            $photoService->store(
+                $this->pendingActionRequestId,
+                array_values($this->photos),
+                (int) Auth::id(),
+            );
+        } catch (ValidationException $exception) {
+            throw $exception;
+        } catch (\Throwable $exception) {
+            $this->addError('photos', $exception->getMessage());
+        } finally {
+            $this->photos = [];
+        }
+    }
+
+    public function deletePhoto(int $photoId, AmenityDeliveryPhotoService $photoService): void
+    {
+        try {
+            $photoService->delete($photoId, (int) Auth::id());
+        } catch (\Throwable $exception) {
+            $this->addError('photos', $exception->getMessage());
+        }
+    }
+
+    private function dialogPhotos(): Collection
+    {
+        if ($this->pendingActionRequestId === null || $this->pendingAction !== 'deliver') {
+            return new Collection();
+        }
+
+        return AmenityRequestPhoto::query()
+            ->where('amenity_request_id', $this->pendingActionRequestId)
+            ->orderBy('amenity_request_photo_id')
+            ->get();
+    }
+
+    public function acceptRequest(
+        int $amenityRequestId,
+        AmenityRequestWorkflowService $workflow,
+    ): void {
+        try {
+            $workflow->acceptRequest(
+                $amenityRequestId,
+                (int) Auth::id(),
+            );
+
+            $this->resetPage();
+
+            session()->flash(
+                'success',
+                'Amenity request accepted. Mark it delivered after the items reach the guest.',
+            );
+        } catch (\Throwable $exception) {
+            $this->addError(
+                'request',
+                $exception->getMessage(),
+            );
+        }
+    }
+
+    public function markDelivered(
+        int $amenityRequestId,
+        AmenityRequestWorkflowService $workflow,
+    ): void {
+        try {
+            $workflow->markDelivered(
+                $amenityRequestId,
+                (int) Auth::id(),
+            );
+
+            $this->resetPage();
+
+            session()->flash(
+                'success',
+                'Amenity request marked as delivered.',
+            );
+        } catch (\Throwable $exception) {
+            $this->addError(
+                'request',
+                $exception->getMessage(),
+            );
+        }
+    }
+
+    public function sortIndicator(string $field): string
+    {
+        if ($this->sortField !== $field) {
+            return '↕';
+        }
+
+        return $this->sortDirection === 'asc'
+            ? '↑'
+            : '↓';
+    }
+
+    public function staffName(
+        mixed $staff,
+        string $fallback = '—',
+    ): string {
+        if ($staff === null) {
+            return $fallback;
+        }
+
+        return $staff->full_name
+            ?? trim(implode(' ', array_filter([
+                $staff->first_name,
+                $staff->middle_name,
+                $staff->last_name,
+            ])))
+            ?: ($staff->username ?? $fallback);
+    }
+
+    private function resetCreateForm(): void
+    {
+        $this->form = [
+            'booking_id' => '',
+            'booking_detail_id' => '',
+        ];
+
+        $this->items = [
+            ['amenity_id' => '', 'quantity' => 1],
+        ];
+
+        $this->resetErrorBag();
+    }
+
+    private function checkedInBookings(): Collection
+    {
+        return Booking::query()
+            ->with('guest')
+            ->whereIn(
+                'status',
+                ['Checked-in', 'Partially Checked-in'],
+            )
+            ->whereHas(
+                'details',
+                fn ($query) => $query->where('status', 'Checked-in'),
+            )
+            ->latest('booking_id')
+            ->get();
+    }
+
+    private function selectedBookingDetails(): Collection
+    {
+        if ($this->form['booking_id'] === '') {
+            return collect();
+        }
+
+        return BookingDetail::query()
+            ->with('facility')
+            ->where(
+                'booking_id',
+                (int) $this->form['booking_id'],
+            )
+            ->where('status', 'Checked-in')
+            ->whereNotNull('facility_id')
+            ->orderBy('booking_details_id')
+            ->get();
+    }
+
+    /** Request limit of an amenity for the facility picked in the form (null until one is picked). */
+    public function maxFor(\App\Models\Amenity $amenity, mixed $bookingDetailId): ?int
+    {
+        if ($bookingDetailId === null || $bookingDetailId === '') {
+            return null;
+        }
+
+        $type = BookingDetail::query()
+            ->with('facility.facilityType')
+            ->find((int) $bookingDetailId)
+            ?->facility
+            ?->facilityType
+            ?->facility_type;
+
+        return $amenity->requestLimitFor($type);
+    }
+
+    private function rentableAmenities(): Collection
+    {
+        return Amenity::query()
+            ->with('amenityName')
+            ->where('amenity_type', 'Rentable')
+            ->orderBy('amenity_name_id')
+            ->get();
+    }
+
+    private function calculateTotal(array $items): float
+    {
+        $total = 0.00;
+
+        foreach ($items as $item) {
+            $amenityId = (int) ($item['amenity_id'] ?? 0);
+            $quantity = (int) ($item['quantity'] ?? 0);
+
+            if ($amenityId > 0 && $quantity > 0) {
+                $price = (float) Amenity::query()
+                    ->whereKey($amenityId)
+                    ->value('amenity_price');
+
+                $total += $price * $quantity;
+            }
+        }
+
+        return round($total, 2);
+    }
+
+    private function requests()
+    {
+        $allowedSorts = [
+            'amenity_request_id',
+            'date_created',
+            'total_price',
+            'amenity_request_status',
+            'delivered_at',
+        ];
+
+        $sortField = in_array(
+            $this->sortField,
+            $allowedSorts,
+            true,
+        )
+            ? $this->sortField
+            : 'amenity_request_id';
+
+        $direction =
+            $this->sortDirection === 'asc'
+                ? 'asc'
+                : 'desc';
+
+        $perPage = in_array(
+            $this->perPage,
+            [10, 25, 50, 100],
+            true,
+        )
+            ? $this->perPage
+            : 10;
+
+        return AmenityRequest::query()
+            ->with([
+                'booking.guest',
+                'details.amenity.amenityName',
+                'details.facility',
+                'user',
+                'assignedTo',
+            ])
+            ->whereIn(
+                'amenity_request_status',
+                ['Pending', 'Delivering', 'Delivered', 'Undelivered'],
+            )
+            ->when(
+                $this->statusFilter !== '',
+                fn ($query) => $query->where(
+                    'amenity_request_status',
+                    $this->statusFilter,
+                ),
+            )
+            ->when(
+                $this->assignmentFilter === 'unassigned',
+                fn ($query) => $query
+                    ->where('amenity_request_status', 'Pending')
+                    ->whereNull('assigned_to_user_id'),
+            )
+            ->when(
+                $this->assignmentFilter === 'mine',
+                fn ($query) => $query->where(
+                    'assigned_to_user_id',
+                    Auth::id(),
+                ),
+            )
+            ->when(
+                $this->assignmentFilter === 'other',
+                fn ($query) => $query
+                    ->whereNotNull('assigned_to_user_id')
+                    ->where(
+                        'assigned_to_user_id',
+                        '!=',
+                        Auth::id(),
+                    ),
+            )
+            ->when(
+                trim($this->search) !== '',
+                function ($query): void {
+                    $search =
+                        '%'.trim($this->search).'%';
+
+                    $query->where(
+                        function ($query) use ($search): void {
+                            $query
+                                ->where(
+                                    'amenity_request_id',
+                                    'like',
+                                    $search,
+                                )
+                                ->orWhereHas(
+                                    'booking',
+                                    fn ($bookingQuery) =>
+                                        $bookingQuery
+                                            ->where(
+                                                'b_ref_no',
+                                                'like',
+                                                $search,
+                                            ),
+                                )
+                                ->orWhereHas(
+                                    'booking.guest',
+                                    function ($guestQuery) use ($search): void {
+                                        $guestQuery
+                                            ->where(
+                                                'first_name',
+                                                'like',
+                                                $search,
+                                            )
+                                            ->orWhere(
+                                                'middle_name',
+                                                'like',
+                                                $search,
+                                            )
+                                            ->orWhere(
+                                                'last_name',
+                                                'like',
+                                                $search,
+                                            )
+                                            ->orWhereRaw(\App\Support\NameSearch::sql('first_name', 'middle_name', 'last_name'), \App\Support\NameSearch::bindings($search))
+                                            ->orWhere(
+                                                'contact_no',
+                                                'like',
+                                                $search,
+                                            )
+                                            ->orWhere(
+                                                'email',
+                                                'like',
+                                                $search,
+                                            );
+                                    },
+                                )
+                                ->orWhereHas(
+                                    'details.facility',
+                                    fn ($facilityQuery) =>
+                                        $facilityQuery
+                                            ->where(
+                                                'facility_name',
+                                                'like',
+                                                $search,
+                                            ),
+                                )
+                                ->orWhereHas(
+                                    'details.amenity',
+                                    function ($amenityQuery) use ($search): void {
+                                        $amenityQuery
+                                            ->where(
+                                                'amenity_description',
+                                                'like',
+                                                $search,
+                                            )
+                                            ->orWhereHas(
+                                                'amenityName',
+                                                fn ($nameQuery) =>
+                                                    $nameQuery
+                                                        ->where(
+                                                            'amenity_name',
+                                                            'like',
+                                                            $search,
+                                                        ),
+                                            );
+                                    },
+                                )
+                                ->orWhereHas(
+                                    'assignedTo',
+                                    function ($staffQuery) use ($search): void {
+                                        $staffQuery
+                                            ->where(
+                                                'first_name',
+                                                'like',
+                                                $search,
+                                            )
+                                            ->orWhere(
+                                                'last_name',
+                                                'like',
+                                                $search,
+                                            )
+                                            ->orWhereRaw(\App\Support\NameSearch::sql('first_name', 'middle_name', 'last_name'), \App\Support\NameSearch::bindings($search))
+                                            ->orWhere(
+                                                'username',
+                                                'like',
+                                                $search,
+                                            );
+                                    },
+                                );
+                        },
+                    );
+                },
+            )
+            ->orderBy($sortField, $direction)
+            ->orderByDesc('amenity_request_id')
+            ->paginate($perPage);
+    }
+};
+
+?>
+
+<div class="space-y-6">
+    <x-staff-page-header
+        eyebrow="Maintenance operations"
+        title="Amenity Delivery Queue"
+        description="Accept amenity requests, track assignment ownership, and confirm delivery after every requested item reaches the guest."
+    >
+        <x-slot:actions>
+            <flux:button
+                wire:click="toggleCreateForm"
+                variant="primary"
+            >
+                {{ $showCreateForm ? 'Close Request Form' : 'Create Amenity Request' }}
+            </flux:button>
+
+            @if (Route::has('maintenance.dashboard'))
+                <flux:button
+                    href="{{ route('maintenance.dashboard') }}"
+                    wire:navigate
+                    variant="ghost"
+                >
+                    Back to Dashboard
+                </flux:button>
+            @endif
+        </x-slot:actions>
+    </x-staff-page-header>
+
+    <x-toast :message="session('success')" fresh />
+
+    @error('request')
+        <div class="rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200">
+            {{ $message }}
+        </div>
+    @enderror
+
+    @if ($showCreateForm)
+        <flux:card>
+            <flux:heading size="lg">Create Amenity Request</flux:heading>
+            <flux:text class="mt-1">
+                Select the guest's checked-in booking detail. The request is assigned to you immediately and remains payable during checkout.
+            </flux:text>
+
+            <form wire:submit="createRequest" novalidate class="mt-5 space-y-5">
+                <div class="grid gap-4 md:grid-cols-2">
+                    <flux:field class="relative">
+                        <flux:label>Checked-in Booking <span class="text-red-500">*</span></flux:label>
+                        <flux:select wire:model.live="form.booking_id" :invalid="$errors->has('form.booking_id')">
+                        <option value="">Select booking</option>
+
+                        @foreach ($checkedInBookings as $booking)
+                            <option value="{{ $booking->booking_id }}">
+                                {{ $booking->b_ref_no }} — {{ $booking->guest?->full_name ?? trim(($booking->guest?->first_name ?? '').' '.($booking->guest?->last_name ?? '')) }}
+                            </option>
+                        @endforeach
+                    </flux:select>
+                        @if ($msg = $this->visibleError('form.booking_id'))
+                            <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $msg }}</p>
+                        @endif
+                    </flux:field>
+
+                    <flux:field class="relative">
+                        <flux:label>Checked-in Facility <span class="text-red-500">*</span></flux:label>
+                        <flux:select wire:model.live="form.booking_detail_id" :invalid="$errors->has('form.booking_detail_id')">
+                        <option value="">Select facility</option>
+
+                        @foreach ($selectedBookingDetails as $detail)
+                            <option value="{{ $detail->booking_details_id }}">
+                                {{ $detail->facility?->facility_name ?? 'Unknown facility' }}
+                            </option>
+                        @endforeach
+                    </flux:select>
+                        @if ($msg = $this->visibleError('form.booking_detail_id'))
+                            <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $msg }}</p>
+                        @endif
+                    </flux:field>
+                </div>
+
+                <div class="space-y-3">
+                    <div class="flex items-center justify-between gap-3">
+                        <flux:heading>Requested Amenities</flux:heading>
+
+                        <flux:button
+                            type="button"
+                            wire:click="addItem"
+                            size="sm"
+                        >
+                            Add Item
+                        </flux:button>
+                    </div>
+
+                    @foreach ($items as $index => $item)
+                        <div
+                            wire:key="maintenance-create-amenity-item-{{ $index }}"
+                            class="grid gap-3 rounded-lg border border-brand-border p-3 dark:border-zinc-800 md:grid-cols-[1fr_7.5rem_auto]"
+                        >
+                            <flux:field class="relative">
+                                <flux:label>Amenity <span class="text-red-500">*</span></flux:label>
+                                <flux:select wire:model.live="items.{{ $index }}.amenity_id" :invalid="$errors->has('items.'.$index.'.amenity_id')">
+                                <option value="">Select amenity</option>
+
+                                @php($pickedElsewhere = collect($items)->except($index)->pluck('amenity_id')->filter()->map(fn ($id): int => (int) $id)->all())
+                                @foreach ($rentableAmenities->reject(fn ($option): bool => in_array((int) $option->amenity_id, $pickedElsewhere, true)) as $amenity)
+                                    <option value="{{ $amenity->amenity_id }}">
+                                        {{ $amenity->amenityName?->amenity_name ?? 'Unnamed amenity' }} — ₱{{ number_format((float) $amenity->amenity_price, 2) }} @if (($max = $this->maxFor($amenity, $form['booking_detail_id'])) !== null)(max {{ $max }})@endif
+                                    </option>
+                                @endforeach
+                            </flux:select>
+                                @if ($msg = $this->visibleError('items.'.$index.'.amenity_id'))
+                                    <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $msg }}</p>
+                                @endif
+                            </flux:field>
+
+                            <flux:field class="relative">
+                                <flux:label>Quantity <span class="text-red-500">*</span></flux:label>
+                                <flux:input wire:model.live="items.{{ $index }}.quantity" type="text" inputmode="numeric" pattern="[0-9]*" x-on:keydown="['e','E','+','-','.',','].includes($event.key) && $event.preventDefault()" x-on:input="$el.value = $el.value.replace(/\D/g, '')" x-on:blur="if ($el.value === '' || Number($el.value) < 1) { $el.value = 1; $el.dispatchEvent(new Event('input', { bubbles: true })) }" :invalid="$errors->has('items.'.$index.'.quantity')" />
+                                @if ($msg = $this->visibleError('items.'.$index.'.quantity'))
+                                    <p class="field-error text-sm font-medium text-red-500 dark:text-red-400">{{ $msg }}</p>
+                                @endif
+                            </flux:field>
+
+                            <div class="flex items-end">
+                                <flux:button
+                                    type="button"
+                                    wire:click="removeItem({{ $index }})"
+                                    variant="danger"
+                                >
+                                    Remove
+                                </flux:button>
+                            </div>
+                        </div>
+                    @endforeach
+                </div>
+
+                <div class="flex flex-col gap-3 rounded-lg bg-brand-surface-muted p-4 dark:bg-zinc-800 sm:flex-row sm:items-center sm:justify-between">
+                    <div>
+                        <flux:text>Request total</flux:text>
+                        <p class="text-2xl font-semibold">₱{{ number_format($currentTotal, 2) }}</p>
+                    </div>
+
+                    <flux:button
+                        type="submit"
+                        variant="primary"
+                        wire:loading.attr="disabled"
+                        wire:target="createRequest"
+                    >
+                        Create and Start Delivery
+                    </flux:button>
+                </div>
+            </form>
+        </flux:card>
+    @endif
+
+    <flux:card class="overflow-hidden p-0">
+
+            <div class="grid gap-3 border-b border-zinc-200 p-4 md:grid-cols-4 dark:border-zinc-800">
+ 
+                    <flux:input
+                        wire:model.live.debounce.300ms="search"
+                        label="Search"
+                        placeholder="Request, booking"
+                        clearable
+                    />
+
+                    <flux:select
+                        wire:model.live="statusFilter"
+                        label="Status"
+                    >
+                        <option value="">All delivery statuses</option>
+                        <option value="Pending">Pending</option>
+                        <option value="Delivering">Delivering</option>
+                        <option value="Delivered">Delivered</option>
+                        <option value="Undelivered">Undelivered</option>
+                    </flux:select>
+
+                    <flux:select
+                        wire:model.live="assignmentFilter"
+                        label="Assignment"
+                    >
+                        <option value="">All assignments</option>
+                        <option value="unassigned">Unassigned pending</option>
+                        <option value="mine">Assigned to me</option>
+                        <option value="other">Assigned to another staff</option>
+                    </flux:select>
+
+                    <div class="flex items-end gap-2">
+                    <flux:select
+                        wire:model.live="perPage"
+                        label="Rows"
+                    >
+                        <option value="10">10</option>
+                        <option value="25">25</option>
+                        <option value="50">50</option>
+                        <option value="100">100</option>
+                    </flux:select>
+
+                <flux:button type="button" wire:click="clearFilters" variant="ghost">Clear Filters</flux:button>
+                </div>
+            </div>
+
+
+        <div class="overflow-x-auto" wire:loading.class="opacity-60" wire:target="search,statusFilter,assignmentFilter,perPage,sortBy,clearFilters">
+            <table class="w-full min-w-[84rem] text-left text-sm">
+                <thead class="border-b border-brand-border bg-zinc-50 text-xs uppercase tracking-wide text-brand-text-muted dark:border-zinc-800 dark:bg-zinc-950/60 dark:text-zinc-400">
+                    <tr>
+
+                        <th class="px-4 py-3">
+                            <button
+                                type="button"
+                                wire:click="sortBy('date_created')"
+                                class="font-semibold hover:text-brand-text dark:hover:text-white"
+                            >
+                                CREATED {{ $this->sortIndicator('date_created') }}
+                            </button>
+                        </th>
+
+                        <th class="px-4 py-3">Guest / Booking</th>
+                        <th class="px-4 py-3">Delivery Items</th>
+
+                        <th class="px-4 py-3">
+                            <button
+                                type="button"
+                                wire:click="sortBy('total_price')"
+                                class="font-semibold hover:text-brand-text dark:hover:text-white"
+                            >
+                                REQUEST VALUE {{ $this->sortIndicator('total_price') }}
+                            </button>
+                        </th>
+
+                        <th class="px-4 py-3">Created By</th>
+                        <th class="px-4 py-3">Assigned To</th>
+
+                        <th class="px-4 py-3">
+                            <button
+                                type="button"
+                                wire:click="sortBy('amenity_request_status')"
+                                class="font-semibold hover:text-brand-text dark:hover:text-white"
+                            >
+                                STATUS {{ $this->sortIndicator('amenity_request_status') }}
+                            </button>
+                        </th>
+
+                        <th class="px-4 py-3">
+                            <button
+                                type="button"
+                                wire:click="sortBy('delivered_at')"
+                                class="font-semibold hover:text-brand-text dark:hover:text-white"
+                            >
+                                DELIVERED {{ $this->sortIndicator('delivered_at') }}
+                            </button>
+                        </th>
+
+                        <th class="px-4 py-3 text-right">Action</th>
+                    </tr>
+                </thead>
+
+                <tbody class="divide-y divide-brand-border/70 dark:divide-zinc-800">
+                    @forelse ($requests as $request)
+                        <tr wire:key="maintenance-amenity-request-{{ $request->amenity_request_id }}" class="align-top text-brand-text transition-colors hover:bg-brand-surface-muted/70 dark:text-zinc-200 dark:hover:bg-zinc-800/60">
+
+                            <td class="px-4 py-4">
+                                {{ $request->date_created?->format('M d, Y') ?? 'N/A' }}
+                            </td>
+
+                            <td class="px-4 py-4">
+                                <p class="font-medium">
+                                    {{ $request->booking?->guest?->full_name
+                                        ?? trim(($request->booking?->guest?->first_name ?? '').' '.($request->booking?->guest?->last_name ?? ''))
+                                        ?: 'Unknown guest' }}
+                                </p>
+
+                                <p class="mt-1 text-xs text-gray-500">
+                                    {{ $request->booking?->b_ref_no ?? 'No booking reference' }}
+                                </p>
+                            </td>
+
+                            <td class="max-w-xl px-4 py-4">
+                                <ul class="space-y-1 text-xs leading-5">
+                                    @foreach ($request->details as $detail)
+                                        <li>
+                                            {{ $detail->amenity?->amenityName?->amenity_name ?? 'Unknown amenity' }}
+                                            × {{ $detail->amenity_quantity }}
+                                            →
+                                            <span class="font-medium">
+                                                {{ $detail->facility?->facility_name ?? 'Unknown facility' }}
+                                            </span>
+                                        </li>
+                                    @endforeach
+                                </ul>
+                                @if ($request->deliveryPhotos->isNotEmpty())
+                                    <div class="mt-2">
+                                        <p class="mb-1 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">
+                                            Proof of delivery ({{ $request->deliveryPhotos->count() }})
+                                        </p>
+                                        <div class="flex flex-wrap gap-1.5">
+                                            @foreach ($request->deliveryPhotos as $photo)
+                                                <a
+                                                    wire:key="delivery-photo-{{ $photo->amenity_request_photo_id }}"
+                                                    href="{{ route('amenity-request-photos.show', $photo) }}"
+                                                    title="Uploaded {{ $photo->created_at?->format('M d, Y · h:i A') }}@if ($photo->uploadedBy) by {{ $photo->uploadedBy->full_name }}@endif"
+                                                    target="_blank"
+                                                    rel="noopener"
+                                                    class="block size-12 overflow-hidden rounded-md border border-zinc-200 dark:border-zinc-700"
+                                                >
+                                                    <img
+                                                        src="{{ route('amenity-request-photos.show', [$photo, 'size' => 'thumb']) }}"
+                                                        alt="{{ $photo->original_name ?? 'Proof of delivery' }}"
+                                                        loading="lazy"
+                                                        class="size-full object-cover"
+                                                    />
+                                                </a>
+                                            @endforeach
+                                        </div>
+                                    </div>
+                                @endif
+                            </td>
+
+                            <td class="px-4 py-4 font-semibold">
+                                ₱{{ number_format((float) $request->total_price, 2) }}
+                            </td>
+
+                            <td class="px-4 py-4">
+                                {{ $this->staffName($request->user) }}
+                            </td>
+
+                            <td class="px-4 py-4">
+                                {{ $this->staffName($request->assignedTo) }}
+                            </td>
+
+                            <td class="px-4 py-4">
+                                <x-status-badge :status="(string) $request->amenity_request_status" />
+                            </td>
+
+                            <td class="px-4 py-4">
+                                {{ $request->delivered_at?->format('M d, Y h:i A') ?? '—' }}
+                            </td>
+
+                            <td class="px-4 py-4 text-right">
+                                @if ($request->amenity_request_status === 'Pending')
+                                    <flux:button
+                                        size="sm"
+                                        variant="primary"
+                                        wire:click="requestAction('accept', {{ $request->amenity_request_id }})"
+                                        icon="check-circle"
+                                    >
+                                        Accept
+                                    </flux:button>
+                                @elseif (
+                                    $request->amenity_request_status === 'Delivering'
+                                    && (int) $request->assigned_to_user_id === (int) Auth::id()
+                                )
+                                    <flux:button
+                                        size="sm"
+                                        variant="primary"
+                                        wire:click="requestAction('deliver', {{ $request->amenity_request_id }})"
+                                        icon="truck"
+                                    >
+                                        Mark Delivered
+                                    </flux:button>
+                                @elseif ($request->amenity_request_status === 'Delivering')
+                                    <span class="text-xs text-gray-500">
+                                        Assigned to another staff
+                                    </span>
+                                @else
+                                    <span class="text-xs text-gray-500">
+                                        Completed
+                                    </span>
+                                @endif
+                            </td>
+                        </tr>
+                    @empty
+                        <tr>
+                            <td colspan="10" class="px-5 py-6">
+                                <x-dashboard-empty-state
+                                    title="No amenity requests found"
+                                    description="No delivery records match the current search, status, and assignment filters."
+                                    class="border-0 bg-transparent py-6 shadow-none dark:bg-transparent"
+                                />
+                            </td>
+                        </tr>
+                    @endforelse
+                </tbody>
+            </table>
+
+
+        </div>
+
+        <div class="border-t border-zinc-200 px-5 py-4 dark:border-zinc-800">
+            {{ $requests->links() }}
+        </div>
+    </flux:card>
+    <flux:modal wire:model="showActionDialog" class="md:w-[30rem]">
+        <div class="space-y-5">
+            <div>
+                <flux:heading size="lg">{{ $pendingAction === 'accept' ? 'Accept amenity request' : 'Confirm delivery' }}</flux:heading>
+                <flux:text class="mt-1">
+                    {{ $pendingAction === 'accept'
+                        ? 'Accept this request and assign it to yourself for delivery?'
+                        : 'Confirm that all requested items were delivered to the guest?' }}
+                </flux:text>
+            </div>
+            @if ($pendingAction === 'deliver')
+                <div class="rounded-lg border border-zinc-200 p-3 dark:border-zinc-700">
+                    <div class="flex items-center justify-between gap-3">
+                        <p class="text-sm font-semibold">Proof of delivery <span class="font-normal text-red-600 dark:text-red-400">(required · at least 1 photo)</span></p>
+                        <span class="text-xs text-zinc-500">{{ $dialogPhotos->count() }} / {{ \App\Services\AmenityDeliveryPhotoService::MAX_PHOTOS }}</span>
+                    </div>
+
+                    @if ($dialogPhotos->count() < \App\Services\AmenityDeliveryPhotoService::MAX_PHOTOS)
+                        <input
+                            type="file"
+                            accept="image/jpeg,image/png,image/webp"
+                            wire:model="photo" x-data x-on:livewire-upload-finish="$el.value = ''"
+                            class="mt-2 block w-full text-sm text-zinc-600 file:mr-3 file:rounded-lg file:border-0 file:bg-zinc-100 file:px-3 file:py-2 file:text-sm file:font-medium dark:text-zinc-300 dark:file:bg-zinc-800"
+                        />
+                        <p class="mt-1 text-xs text-zinc-500">JPG, PNG or WebP · one photo at a time · up to 64 MB each · up to {{ \App\Services\AmenityDeliveryPhotoService::MAX_PHOTOS }} photos.</p>
+                        <p wire:loading wire:target="photo" class="mt-1 text-xs font-medium text-blue-600 dark:text-blue-400">Uploading…</p>
+                    @else
+                        <p class="mt-2 text-xs text-amber-700 dark:text-amber-300">Photo limit reached. Remove a photo to add another.</p>
+                    @endif
+
+                    @error('photos') <p class="mt-2 text-sm font-medium text-red-500 dark:text-red-400">{{ $message }}</p> @enderror
+                    @error('photos.*') <p class="mt-2 text-sm font-medium text-red-500 dark:text-red-400">{{ $message }}</p> @enderror
+
+                    @if ($dialogPhotos->isNotEmpty())
+                        <div class="mt-3 grid grid-cols-4 gap-2">
+                            @foreach ($dialogPhotos as $photo)
+                                <div wire:key="dialog-photo-{{ $photo->amenity_request_photo_id }}" class="relative overflow-hidden rounded-md border border-zinc-200 dark:border-zinc-700">
+                                    <img
+                                        src="{{ route('amenity-request-photos.show', [$photo, 'size' => 'thumb']) }}"
+                                        alt="{{ $photo->original_name ?? 'Proof of delivery' }}"
+                                        class="aspect-square w-full object-cover"
+                                    />
+                                    <p class="px-1 py-0.5 text-[10px] leading-tight text-zinc-500 dark:text-zinc-400">{{ $photo->created_at?->format('M d, h:i A') }}@if ($photo->uploadedBy)<br>by {{ $photo->uploadedBy->full_name }}@endif</p>
+                                    <button
+                                        type="button"
+                                        wire:click="deletePhoto({{ $photo->amenity_request_photo_id }})"
+                                        wire:confirm="Remove this photo?"
+                                        class="absolute right-1 top-1 rounded-full bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white hover:bg-red-600"
+                                        aria-label="Remove photo"
+                                    >
+                                        ✕
+                                    </button>
+                                </div>
+                            @endforeach
+                        </div>
+                    @endif
+                </div>
+            @endif
+
+            <div class="flex justify-end gap-3">
+                <flux:button type="button" variant="ghost" wire:click="$set('showActionDialog', false)">Cancel</flux:button>
+                <flux:button
+                    type="button"
+                    variant="primary"
+                    wire:click="confirmAction"
+                    :disabled="$pendingAction === 'deliver' && $dialogPhotos->isEmpty()"
+                >
+                    {{ $pendingAction === 'accept' ? 'Accept Request' : 'Mark Delivered' }}
+                </flux:button>
+            </div>
+        </div>
+    </flux:modal>
+
+</div>
