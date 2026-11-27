@@ -19,7 +19,8 @@ return new class extends Migration
 
         Schema::create('tbl_facility_inspection_photo', function (Blueprint $table): void {
             $table->id('facility_inspection_photo_id');
-            $table->unsignedBigInteger('facility_inspection_request_id')->index();
+            // Explicit short name: the default one is 66 characters and MySQL allows 64.
+            $table->unsignedBigInteger('facility_inspection_request_id')->index('fac_insp_photo_request_idx');
             $table->unsignedBigInteger('booking_details_id')->index();
             $table->unsignedBigInteger('uploaded_by_user_id')->nullable()->index();
             $table->string('path', 255);
