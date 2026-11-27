@@ -7,35 +7,32 @@ use Illuminate\Support\Facades\Schema;
 return new class extends Migration
 {
     /**
-     * Condition photos maintenance staff take of a facility while no guest is
-     * checked in. status: Current (ready for the next guest) -> In Use (attached
-     * to the stay that checked in) -> Outdated (that stay ended; new photos needed).
+     * Photos a maintenance staff member attaches to an inspection as proof of
+     * damage. Files live on the private disk; only the path is stored here.
+     * Like the other inspection tables, no foreign keys (custom-schema project).
      */
     public function up(): void
     {
-        if (Schema::hasTable('tbl_facility_condition_photo')) {
+        if (Schema::hasTable('tbl_facility_inspection_photo')) {
             return;
         }
 
-        Schema::create('tbl_facility_condition_photo', function (Blueprint $table): void {
-            $table->id('facility_condition_photo_id');
-            $table->unsignedBigInteger('facility_id')->index();
-            $table->unsignedBigInteger('booking_details_id')->nullable()->index();
-            $table->unsignedBigInteger('uploaded_by_user_id')->nullable();
+        Schema::create('tbl_facility_inspection_photo', function (Blueprint $table): void {
+            $table->id('facility_inspection_photo_id');
+            // Explicit short name: the default one is 66 characters and MySQL allows 64.
+            $table->unsignedBigInteger('facility_inspection_request_id')->index('fac_insp_photo_request_idx');
+            $table->unsignedBigInteger('booking_details_id')->index();
+            $table->unsignedBigInteger('uploaded_by_user_id')->nullable()->index();
             $table->string('path', 255);
             $table->string('original_name', 255)->nullable();
             $table->string('mime_type', 100)->nullable();
             $table->unsignedBigInteger('file_size')->default(0); // bytes
-            $table->string('status', 20)->default('Current'); // Current / In Use / Outdated
-            $table->timestamp('outdated_at')->nullable();
             $table->timestamps();
-
-            $table->index(['facility_id', 'status'], 'fcp_facility_status_idx');
         });
     }
 
     public function down(): void
     {
-        Schema::dropIfExists('tbl_facility_condition_photo');
+        Schema::dropIfExists('tbl_facility_inspection_photo');
     }
 };
